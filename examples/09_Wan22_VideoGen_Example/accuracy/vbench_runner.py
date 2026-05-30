@@ -33,8 +33,25 @@ import traceback
 from importlib.resources import files as _pkg_files
 
 import torch
-import vbench as _vbench_pkg
-from vbench import VBench
+
+# vbench==0.1.5 was authored when torch.load defaulted to weights_only=False.
+# PyTorch 2.6+ flipped the default to True, breaking vbench's checkpoint loads
+# (e.g. motion_smoothness AMT model with typing.OrderedDict). Monkey-patch
+# BEFORE vbench is imported so every torch.load call inside vbench inherits
+# the old behavior.
+_orig_torch_load = torch.load
+
+
+def _torch_load_compat(*args, **kwargs):
+    if "weights_only" not in kwargs:
+        kwargs["weights_only"] = False
+    return _orig_torch_load(*args, **kwargs)
+
+
+torch.load = _torch_load_compat
+
+import vbench as _vbench_pkg  # noqa: E402  (intentional late import after torch.load patch)
+from vbench import VBench  # noqa: E402
 
 
 def _emit_error(exc: BaseException) -> None:

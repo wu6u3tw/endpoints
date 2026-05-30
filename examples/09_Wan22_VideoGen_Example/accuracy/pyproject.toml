@@ -19,7 +19,7 @@
 name = "wan22-vbench-accuracy"
 version = "0.1.0"
 description = "Isolated VBench accuracy environment for the WAN 2.2 example."
-requires-python = ">=3.12"
+requires-python = "==3.11.*"
 dependencies = [
     "vbench==0.1.5",
 ]
@@ -27,3 +27,10 @@ dependencies = [
 [tool.uv]
 # Script-runner env: no build, no install of this project itself.
 package = false
+
+# Skip decord (no aarch64 wheel for 0.6.0). Local decord.py shim in this
+# directory wraps cv2 to provide VBench's API surface; Python finds it
+# via sys.path[0] when vbench_runner.py runs from here.
+override-dependencies = [
+    "decord ; python_version < '0'",
+]
