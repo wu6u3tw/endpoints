@@ -26,11 +26,14 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import random
 import shutil
 import signal
 import tempfile
 import uuid
+from collections.abc import Callable
 from dataclasses import dataclass, field
+from dataclasses import replace as dataclass_replace
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -40,6 +43,7 @@ import msgspec
 import msgspec.json
 from huggingface_hub import model_info
 from tqdm import tqdm
+from transformers import AutoTokenizer
 from transformers.utils import logging as transformers_logging
 
 from inference_endpoint.async_utils.event_publisher import EventPublisherService
@@ -53,6 +57,9 @@ from inference_endpoint.async_utils.services.metrics_aggregator.snapshot import 
 )
 from inference_endpoint.async_utils.services.metrics_aggregator.subscriber import (
     MetricsSnapshotSubscriber,
+)
+from inference_endpoint.async_utils.services.metrics_aggregator.token_metrics import (
+    _normalize_tool_calls_for_template,
 )
 from inference_endpoint.async_utils.transport.zmq.context import ManagedZMQContext
 from inference_endpoint.config.runtime_settings import RuntimeSettings
@@ -69,6 +76,7 @@ from inference_endpoint.config.schema import (
 from inference_endpoint.core.types import QueryResult
 from inference_endpoint.dataset_manager.dataset import Dataset
 from inference_endpoint.dataset_manager.factory import DataLoaderFactory
+from inference_endpoint.dataset_manager.multi_turn_dataset import MultiTurnDataset
 from inference_endpoint.endpoint_client.cpu_affinity import AffinityPlan, pin_loadgen
 from inference_endpoint.endpoint_client.http_client import HTTPEndpointClient
 from inference_endpoint.endpoint_client.http_sample_issuer import HttpClientSampleIssuer
@@ -79,6 +87,8 @@ from inference_endpoint.exceptions import (
     InputValidationError,
     SetupError,
 )
+from inference_endpoint.load_generator.conversation_manager import ConversationManager
+from inference_endpoint.load_generator.multi_turn_strategy import MultiTurnStrategy
 from inference_endpoint.load_generator.session import (
     BenchmarkSession,
     PhaseConfig,
@@ -135,12 +145,13 @@ class BenchmarkResult:
 @dataclass
 class AccuracyConfiguration:
     scorer: type[Scorer]
-    extractor: type[Extractor]
+    extractor: type[Extractor] | None
     dataset_name: str
     dataset: Dataset
     report_dir: Path
     ground_truth_column: str | None
     num_repeats: int
+    extras: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -243,11 +254,22 @@ def _load_datasets(
         if (
             acc_cfg.accuracy_config is None
             or acc_cfg.accuracy_config.eval_method is None
-            or acc_cfg.accuracy_config.extractor is None
         ):
             raise InputValidationError(
-                f"Dataset '{acc_cfg.name}' requires accuracy_config with eval_method and extractor"
+                f"Dataset '{acc_cfg.name}' requires accuracy_config with eval_method"
             )
+
+        scorer_cls = Scorer.get(acc_cfg.accuracy_config.eval_method)
+        extractor_name = acc_cfg.accuracy_config.extractor
+        if extractor_name is None:
+            if scorer_cls.REQUIRES_EXTRACTOR:
+                raise InputValidationError(
+                    f"Dataset '{acc_cfg.name}' uses scorer "
+                    f"'{acc_cfg.accuracy_config.eval_method}' which requires an extractor"
+                )
+            extractor_cls: type[Extractor] | None = None
+        else:
+            extractor_cls = Extractor.get(extractor_name)
 
         ds = DataLoaderFactory.create_loader(
             acc_cfg, num_repeats=acc_cfg.accuracy_config.num_repeats
@@ -256,13 +278,14 @@ def _load_datasets(
         # TODO add tests and defaults
         eval_configs.append(
             AccuracyConfiguration(
-                Scorer.get(acc_cfg.accuracy_config.eval_method),
-                Extractor.get(acc_cfg.accuracy_config.extractor),
+                scorer_cls,
+                extractor_cls,
                 acc_cfg.name,
                 ds,
                 report_dir,
                 acc_cfg.accuracy_config.ground_truth,
                 acc_cfg.accuracy_config.num_repeats,
+                acc_cfg.accuracy_config.extras or {},
             )
         )
         ds.load(
@@ -289,6 +312,75 @@ def _load_datasets(
         raise SetupError(f"Failed to load dataset: {e}") from e
 
     return dataloader, accuracy_datasets, eval_configs
+
+
+def _precompute_isl_for_multi_turn(
+    dataloader: MultiTurnDataset, tokenizer_name: str
+) -> None:
+    """Tokenize pre-built message lists and store token counts in each sample.
+
+    Runs apply_chat_template once per client turn so the hot-path IslTrigger
+    sync path (len(token_ids)) is used instead of on-the-fly text tokenization.
+    Only affects dataset-history turns; live-history turns override 'messages'
+    at runtime so the stored input_tokens are stale (acceptable approximation).
+    """
+    try:
+        tokenizer = AutoTokenizer.from_pretrained(tokenizer_name)
+    except Exception:
+        logger.exception(
+            "ISL pre-computation: failed to load tokenizer %s; "
+            "falling back to text-tokenization at runtime",
+            tokenizer_name,
+        )
+        return
+    skipped = 0
+    first_failure_logged = False
+    for sample in dataloader.data or []:
+        messages = sample.get("messages")
+        if not messages:
+            continue
+        try:
+            normalized_messages = []
+            for msg in messages:
+                if msg.get("tool_calls"):
+                    msg = {
+                        **msg,
+                        "tool_calls": _normalize_tool_calls_for_template(
+                            msg["tool_calls"]
+                        ),
+                    }
+                normalized_messages.append(msg)
+            tools = sample.get("tools")
+            raw = tokenizer.apply_chat_template(
+                normalized_messages,
+                tools=tools if tools else None,
+                tokenize=True,
+                add_generation_prompt=True,
+            )
+            # Some tokenizers (e.g. Qwen3 fast tokenizer) return BatchEncoding
+            # instead of a plain list; extract .input_ids in that case.
+            token_ids: list[int] = raw.input_ids if hasattr(raw, "input_ids") else raw
+            sample["input_tokens"] = token_ids
+        except Exception:
+            if not first_failure_logged:
+                logger.exception(
+                    "ISL pre-computation: apply_chat_template failed (first failure shown)"
+                )
+                first_failure_logged = True
+            skipped += 1
+    if skipped:
+        logger.warning(
+            "ISL pre-computation: %d turn(s) skipped (apply_chat_template failed)",
+            skipped,
+        )
+    total_with_messages = len([s for s in (dataloader.data or []) if s.get("messages")])
+    if total_with_messages > 0 and skipped == total_with_messages:
+        logger.warning(
+            "ISL precomputation: all %d turn(s) failed apply_chat_template; "
+            "ISL metrics will use text-tokenization fallback. "
+            "Check tokenizer/template compatibility.",
+            total_with_messages,
+        )
 
 
 def setup_benchmark(config: BenchmarkConfig, test_mode: TestMode) -> BenchmarkContext:
@@ -320,6 +412,10 @@ def setup_benchmark(config: BenchmarkConfig, test_mode: TestMode) -> BenchmarkCo
     # Datasets
     dataloader, accuracy_datasets, eval_configs = _load_datasets(config, report_dir)
 
+    if isinstance(dataloader, MultiTurnDataset) and tokenizer_name is not None:
+        logger.info("Pre-computing ISL token counts for multi-turn dataset…")
+        _precompute_isl_for_multi_turn(dataloader, tokenizer_name)
+
     # Setup runtime settings using factory method
     rt_settings = RuntimeSettings.from_config(config, dataloader.num_samples())
 
@@ -350,14 +446,50 @@ def setup_benchmark(config: BenchmarkConfig, test_mode: TestMode) -> BenchmarkCo
     )
 
 
-def _build_phases(ctx: BenchmarkContext) -> list[PhaseConfig]:
+def _build_phases(
+    ctx: BenchmarkContext,
+    perf_strategy: MultiTurnStrategy | None = None,
+) -> list[PhaseConfig]:
     """Build the phase list from BenchmarkContext."""
     phases: list[PhaseConfig] = []
+
+    # Warmup phase (optional, before performance)
+    warmup_cfg = ctx.config.settings.warmup
+    if warmup_cfg.enabled:
+        warmup_dataset: Dataset = (
+            ctx.dataloader.with_salt(random.Random(warmup_cfg.warmup_random_seed + 2))
+            if warmup_cfg.salt
+            else ctx.dataloader
+        )
+        warmup_rt = dataclass_replace(
+            ctx.rt_settings,
+            min_duration_ms=0,
+            max_duration_ms=None,
+            n_samples_from_dataset=ctx.dataloader.num_samples(),
+            n_samples_to_issue=warmup_cfg.n_requests,
+            min_sample_count=1,
+            rng_sched=random.Random(warmup_cfg.warmup_random_seed),
+            rng_sample_index=random.Random(warmup_cfg.warmup_random_seed + 1),
+            load_pattern=ctx.rt_settings.load_pattern,
+        )
+        phases.append(
+            PhaseConfig(
+                "warmup",
+                warmup_rt,
+                warmup_dataset,
+                PhaseType.WARMUP,
+                drain_after=warmup_cfg.drain,
+            )
+        )
 
     # Performance phase
     phases.append(
         PhaseConfig(
-            "performance", ctx.rt_settings, ctx.dataloader, PhaseType.PERFORMANCE
+            "performance",
+            ctx.rt_settings,
+            ctx.dataloader,
+            PhaseType.PERFORMANCE,
+            strategy=perf_strategy,
         )
     )
 
@@ -365,6 +497,17 @@ def _build_phases(ctx: BenchmarkContext) -> list[PhaseConfig]:
     # what Scorer._load_sample_index_map() looks up in sample_idx_map.json
     for eval_cfg in ctx.eval_configs:
         acc_ds = eval_cfg.dataset
+        if isinstance(acc_ds, MultiTurnDataset):
+            raise InputValidationError(
+                f"Accuracy dataset '{eval_cfg.dataset_name}' is a MultiTurnDataset, "
+                "which is not yet supported for accuracy evaluation."
+            )
+        # Accuracy phases run at MAX_THROUGHPUT; inheriting perf_lp (e.g. POISSON)
+        # would silently rate-limit evaluation until a multi-turn accuracy strategy
+        # and QPS-budgeting support are added.
+        acc_load_pattern: LoadPattern | None = LoadPattern(
+            type=LoadPatternType.MAX_THROUGHPUT
+        )
         acc_settings = RuntimeSettings(
             metric_target=ctx.rt_settings.metric_target,
             reported_metrics=ctx.rt_settings.reported_metrics,
@@ -375,7 +518,7 @@ def _build_phases(ctx: BenchmarkContext) -> list[PhaseConfig]:
             min_sample_count=acc_ds.num_samples() * acc_ds.repeats,
             rng_sched=ctx.rt_settings.rng_sched,
             rng_sample_index=ctx.rt_settings.rng_sample_index,
-            load_pattern=LoadPattern(type=LoadPatternType.MAX_THROUGHPUT),
+            load_pattern=acc_load_pattern,
         )
         phases.append(
             PhaseConfig(eval_cfg.dataset_name, acc_settings, acc_ds, PhaseType.ACCURACY)
@@ -512,7 +655,10 @@ async def _run_benchmark_async(
             # client.api_type is propagated from endpoint_config.api_type by
             # BenchmarkConfig._propagate_client_api_type — no override needed here.
             http_config = config.settings.client.with_updates(
-                endpoint_urls=[urljoin(e, api_type.default_route()) for e in endpoints],
+                endpoint_urls=[
+                    urljoin(e.rstrip("/") + "/", api_type.default_route())
+                    for e in endpoints
+                ],
                 api_key=config.endpoint_config.api_key,
                 event_logs_dir=ctx.report_dir,
                 cpu_affinity=ctx.affinity_plan,
@@ -525,24 +671,98 @@ async def _run_benchmark_async(
             launcher.kill_all()
             raise SetupError(f"Failed to connect to endpoint: {e}") from e
 
+        # Build multi-turn strategy if the performance dataset is a MultiTurnDataset.
+        multi_turn_strategy: MultiTurnStrategy | None = None
+        if isinstance(ctx.dataloader, MultiTurnDataset):
+            mt_cfg = None
+            if ctx.config.datasets:
+                perf_ds_cfg = next(
+                    (
+                        d
+                        for d in ctx.config.datasets
+                        if d.type == DatasetType.PERFORMANCE
+                    ),
+                    None,
+                )
+                if perf_ds_cfg is not None:
+                    mt_cfg = perf_ds_cfg.multi_turn
+            assert ctx.dataloader.conversation_metadata is not None
+            multi_turn_strategy = MultiTurnStrategy(
+                conversation_manager=ConversationManager(),
+                dataset_metadata=ctx.dataloader.conversation_metadata,
+                multi_turn_config=mt_cfg,
+                target_concurrency=ctx.config.settings.load_pattern.target_concurrency,
+            )
+
+        _on_sample_complete: Callable[[QueryResult], None]
+        if multi_turn_strategy is not None:
+
+            def _on_sample_complete(result: QueryResult) -> None:
+                try:
+                    multi_turn_strategy.on_sample_complete(result)
+                except Exception:
+                    logger.exception(
+                        "multi_turn_strategy.on_sample_complete failed (result=%s)",
+                        result.id,
+                    )
+                try:
+                    collector.on_complete_hook(result)
+                except Exception:
+                    logger.exception(
+                        "collector.on_complete_hook failed (result=%s)", result.id
+                    )
+
+            multi_turn_strategy._session_on_sample_complete = _on_sample_complete
+            multi_turn_strategy._session_publisher = publisher
+
+        else:
+            _on_sample_complete = collector.on_complete_hook
+
         # Create session
         session = BenchmarkSession(
             issuer=issuer,
             event_publisher=publisher,
             loop=loop,
-            on_sample_complete=collector.on_complete_hook,
+            on_sample_complete=_on_sample_complete,
             session_id=session_id,
         )
 
-        phases = _build_phases(ctx)
+        phases = _build_phases(ctx, perf_strategy=multi_turn_strategy)
         report: Report | None = None
+
+        # Timer starts when the performance phase begins (after warmup drains),
+        # so max_duration_ms applies only to the perf phase, not warmup.
+        global_timeout_handle = None
+        _timeout_done = False
+        max_duration_ms = ctx.rt_settings.max_duration_ms
+
+        def _on_global_timeout() -> None:
+            if not _timeout_done:
+                logger.warning(
+                    "Global experiment timeout reached (%d ms); stopping session.",
+                    max_duration_ms,
+                )
+                session.stop()
+
+        def _on_phase_start(phase: PhaseConfig) -> None:
+            nonlocal global_timeout_handle
+            if (
+                phase.phase_type == PhaseType.PERFORMANCE
+                and max_duration_ms is not None
+            ):
+                global_timeout_handle = loop.call_later(
+                    max_duration_ms / 1000.0, _on_global_timeout
+                )
 
         loop.add_signal_handler(signal.SIGINT, session.stop)
         try:
-            result = await session.run(phases)
+            result = await session.run(phases, on_phase_start=_on_phase_start)
         except Exception as e:
             raise ExecutionError(f"Benchmark execution failed: {e}") from e
         finally:
+            _timeout_done = True
+            if global_timeout_handle is not None:
+                global_timeout_handle.cancel()
             loop.remove_signal_handler(signal.SIGINT)
             logger.info("Cleaning up...")
             try:
@@ -683,13 +903,16 @@ def finalize_benchmark(ctx: BenchmarkContext, bench: BenchmarkResult) -> None:
             eval_cfg.report_dir,
             extractor=eval_cfg.extractor,
             ground_truth_column=eval_cfg.ground_truth_column,
+            **eval_cfg.extras,
         )
         score, n_repeats = scorer_instance.score()
         assert eval_cfg.dataset.data is not None
         accuracy_scores[eval_cfg.dataset_name] = {
             "dataset_name": eval_cfg.dataset_name,
             "num_samples": len(eval_cfg.dataset.data),
-            "extractor": eval_cfg.extractor.__name__,
+            "extractor": (
+                eval_cfg.extractor.__name__ if eval_cfg.extractor is not None else None
+            ),
             "ground_truth_column": eval_cfg.ground_truth_column,
             "score": score,
             "n_repeats": n_repeats,

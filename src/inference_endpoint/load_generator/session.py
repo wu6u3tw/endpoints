@@ -21,14 +21,15 @@ See docs/load_generator/DESIGN.md for the full design.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import time
 import uuid
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
-from typing import Protocol
+from typing import Any, Protocol
 
 from ..config.runtime_settings import RuntimeSettings
 from ..core.record import (
@@ -44,7 +45,28 @@ from .strategy import LoadStrategy, create_load_strategy
 
 logger = logging.getLogger(__name__)
 
-_WARMUP_ENABLED = os.environ.get("ENABLE_WARMUP") == "1"
+
+def _extract_prompt_text(messages: list[Any]) -> str | None:
+    """Join text content from an OpenAI messages list; handles list-form multimodal content."""
+    parts: list[str] = []
+    for m in messages:
+        if not isinstance(m, dict):
+            continue
+        c = m.get("content")
+        if isinstance(c, str) and c:
+            parts.append(c)
+        elif isinstance(c, list):
+            parts.extend(
+                p["text"]
+                for p in c
+                if isinstance(p, dict)
+                and p.get("type") == "text"
+                and isinstance(p.get("text"), str)
+            )
+        tc = m.get("tool_calls")
+        if tc:
+            parts.append(json.dumps(tc, separators=(",", ":")))
+    return "\n".join(parts) if parts else None
 
 
 # ---------------------------------------------------------------------------
@@ -68,6 +90,8 @@ class PhaseConfig:
     runtime_settings: RuntimeSettings
     dataset: Dataset
     phase_type: PhaseType = PhaseType.PERFORMANCE
+    drain_after: bool = True
+    strategy: LoadStrategy | None = field(default=None, compare=False)
 
 
 # ---------------------------------------------------------------------------
@@ -153,6 +177,8 @@ class PhaseIssuer:
         "_publisher",
         "_stop_check",
         "uuid_to_index",
+        "uuid_to_conv_info",
+        "completed_uuids",
         "inflight",
         "issued_count",
     )
@@ -169,13 +195,27 @@ class PhaseIssuer:
         self._publisher = publisher
         self._stop_check = stop_check
         self.uuid_to_index: dict[str, int] = {}
+        self.uuid_to_conv_info: dict[str, tuple[str, int | None]] = {}
+        self.completed_uuids: set[str] = set()
         self.inflight: int = 0
         self.issued_count: int = 0
 
-    def issue(self, sample_index: int) -> str | None:
+    def issue(
+        self,
+        sample_index: int,
+        data_override: dict[str, Any] | None = None,
+        conversation_id: str = "",
+        turn: int | None = None,
+    ) -> str | None:
         """Load data, build Query, publish ISSUED, send to endpoint.
 
         Returns query_id on success, None if session is stopping.
+
+        Args:
+            sample_index: Index into the dataset.
+            data_override: If provided, merged over the loaded sample data.
+                Keys in data_override take precedence. Used by MultiTurnStrategy
+                to substitute live-accumulated message history.
 
         Note: load_sample() runs synchronously before the ISSUED timestamp.
         For accurate timing, datasets MUST be pre-loaded into memory.
@@ -185,8 +225,11 @@ class PhaseIssuer:
             return None
         query_id = uuid.uuid4().hex
         data = self._dataset.load_sample(sample_index)
+        if data_override is not None:
+            data = {**data, **data_override}
         query = Query(id=query_id, data=data)
         self.uuid_to_index[query_id] = sample_index
+        self.uuid_to_conv_info[query_id] = (conversation_id, turn)
         ts = time.monotonic_ns()
         prompt_data: PromptData
         if isinstance(data, dict):
@@ -197,9 +240,11 @@ class PhaseIssuer:
             # meaningful for ISL reporting on text-only prompts.
             # Therefore, setting `text=None` for non-string prompts
             # means that ISL reporting will be unavailable for multimodal samples.
-            prompt = data.get("prompt")
+            prompt_text = data.get("prompt")
+            if prompt_text is None and "messages" in data:
+                prompt_text = _extract_prompt_text(data["messages"])
             prompt_data = PromptData(
-                text=prompt if isinstance(prompt, str) else None,
+                text=prompt_text if isinstance(prompt_text, str) else None,
                 token_ids=tuple(token_ids) if token_ids is not None else None,
             )
         else:
@@ -209,11 +254,38 @@ class PhaseIssuer:
                 event_type=SampleEventType.ISSUED,
                 timestamp_ns=ts,
                 sample_uuid=query_id,
+                conversation_id=conversation_id,
+                turn=turn,
                 data=prompt_data,
             )
         )
         self._issuer.issue(query)
         self.inflight += 1
+        self.issued_count += 1
+        return query_id
+
+    def register_skipped(
+        self,
+        sample_index: int,
+        conversation_id: str = "",
+        turn: int | None = None,
+    ) -> str | None:
+        if self._stop_check():
+            return None
+        query_id = uuid.uuid4().hex
+        self.uuid_to_index[query_id] = sample_index
+        self.uuid_to_conv_info[query_id] = (conversation_id, turn)
+        self.completed_uuids.add(query_id)
+        self._publisher.publish(
+            EventRecord(
+                event_type=SampleEventType.ISSUED,
+                timestamp_ns=time.monotonic_ns(),
+                sample_uuid=query_id,
+                conversation_id=conversation_id,
+                turn=turn,
+                data=PromptData(),
+            )
+        )
         self.issued_count += 1
         return query_id
 
@@ -249,6 +321,7 @@ class BenchmarkSession:
         self._stop_requested = False
         self._done = False
         self._current_phase_issuer: PhaseIssuer | None = None
+        self._current_phase_type: PhaseType | None = None
         self._current_strategy: LoadStrategy | None = None
         self._recv_task: asyncio.Task | None = None
         self._strategy_task: asyncio.Task | None = None
@@ -266,7 +339,11 @@ class BenchmarkSession:
         if self._strategy_task and not self._strategy_task.done():
             self._strategy_task.cancel()
 
-    async def run(self, phases: list[PhaseConfig]) -> SessionResult:
+    async def run(
+        self,
+        phases: list[PhaseConfig],
+        on_phase_start: Callable[[PhaseConfig], None] | None = None,
+    ) -> SessionResult:
         """Run all benchmark phases sequentially.
 
         Returns SessionResult with per-phase results.
@@ -281,12 +358,8 @@ class BenchmarkSession:
             for phase in phases:
                 if self._stop_requested:
                     break
-                if phase.phase_type == PhaseType.WARMUP and not _WARMUP_ENABLED:
-                    logger.info(
-                        "Skipping warmup phase %s (set ENABLE_WARMUP=1 to enable)",
-                        phase.name,
-                    )
-                    continue
+                if on_phase_start is not None:
+                    on_phase_start(phase)
                 result = await self._run_phase(phase)
                 if result is not None:
                     phase_results.append(result)
@@ -313,10 +386,13 @@ class BenchmarkSession:
         phase_start = time.monotonic_ns()
 
         # Create per-phase state
-        sample_order = create_sample_order(phase.runtime_settings)
-        strategy = create_load_strategy(
-            phase.runtime_settings, self._loop, sample_order
-        )
+        if phase.strategy is not None:
+            strategy = phase.strategy
+        else:
+            sample_order = create_sample_order(phase.runtime_settings)
+            strategy = create_load_strategy(
+                phase.runtime_settings, self._loop, sample_order
+            )
         phase_issuer = PhaseIssuer(
             dataset=phase.dataset,
             issuer=self._issuer,
@@ -325,6 +401,7 @@ class BenchmarkSession:
         )
 
         self._current_phase_issuer = phase_issuer
+        self._current_phase_type = phase.phase_type
         self._current_strategy = strategy
 
         # Performance phases get tracking events
@@ -340,8 +417,7 @@ class BenchmarkSession:
         finally:
             self._strategy_task = None
 
-        # Drain in-flight (skip for warmup — keep concurrency hot)
-        if phase.phase_type != PhaseType.WARMUP:
+        if phase.drain_after:
             await self._drain_inflight(phase_issuer)
 
         if phase.phase_type == PhaseType.PERFORMANCE:
@@ -370,14 +446,23 @@ class BenchmarkSession:
     async def _drain_inflight(self, phase_issuer: PhaseIssuer) -> None:
         """Wait for all in-flight responses from this phase to complete.
 
-        Currently, there is no timeout for the drain step. In the future,
-        we can possibly add a dynamic timeout based on the rate of completion
-        throughout the current phase."""
+        Timeout defaults to 240 s; override via INFERENCE_ENDPOINT_DRAIN_TIMEOUT
+        (seconds). Needed for multi-minute samples like video generation, where
+        the default cuts the phase off before steady-state samples land."""
         if phase_issuer.inflight <= 0 or self._stop_requested:
             return
+        drain_timeout = float(os.environ.get("INFERENCE_ENDPOINT_DRAIN_TIMEOUT", "240"))
         logger.info("Draining %d in-flight responses...", phase_issuer.inflight)
         self._drain_event.clear()
-        await self._drain_event.wait()
+        try:
+            await asyncio.wait_for(self._drain_event.wait(), timeout=drain_timeout)
+        except TimeoutError:
+            logger.error(
+                "Drain timed out after %.0f s with %d responses still in flight; "
+                "proceeding to next phase.",
+                drain_timeout,
+                phase_issuer.inflight,
+            )
 
     async def _receive_responses(self) -> None:
         """Receive responses from the issuer. Runs as a concurrent task."""
@@ -407,6 +492,20 @@ class BenchmarkSession:
 
         if isinstance(resp, QueryResult):
             query_id = resp.id
+            # Drop late responses for queries already terminated (e.g. by
+            # MultiTurnStrategy._handle_timeout). Without this gate, a real
+            # response arriving after timeout double-publishes ERROR/COMPLETE
+            # and double-decrements inflight (no per-request HTTP timeout
+            # exists in endpoint_client; late arrivals are possible).
+            if phase_issuer is not None and query_id in phase_issuer.completed_uuids:
+                return
+
+            conv_id_str, turn_num = ("", None)
+            if phase_issuer is not None:
+                conv_id_str, turn_num = phase_issuer.uuid_to_conv_info.pop(
+                    query_id, ("", None)
+                )
+
             # Emit ERROR before COMPLETE for failed queries so downstream
             # consumers (notably the metrics aggregator) see the ERROR
             # while the in-flight tracked row still exists. COMPLETE
@@ -425,26 +524,36 @@ class BenchmarkSession:
                         event_type=ErrorEventType.GENERIC,
                         timestamp_ns=time.monotonic_ns(),
                         sample_uuid=query_id,
+                        conversation_id=conv_id_str,
+                        turn=turn_num,
                         data=resp.error,
                     )
                 )
-            self._publisher.publish(
-                EventRecord(
-                    event_type=SampleEventType.COMPLETE,
-                    timestamp_ns=resp.completed_at
-                    if isinstance(resp.completed_at, int)
-                    else time.monotonic_ns(),
-                    sample_uuid=query_id,
-                    data=resp.response_output,
+            if self._current_phase_type != PhaseType.WARMUP:
+                self._publisher.publish(
+                    EventRecord(
+                        event_type=SampleEventType.COMPLETE,
+                        timestamp_ns=resp.completed_at
+                        if isinstance(resp.completed_at, int)
+                        else time.monotonic_ns(),
+                        sample_uuid=query_id,
+                        conversation_id=conv_id_str,
+                        turn=turn_num,
+                        data=resp.response_output,
+                    )
                 )
-            )
+
             if phase_issuer is not None and query_id in phase_issuer.uuid_to_index:
+                phase_issuer.completed_uuids.add(query_id)
                 phase_issuer.inflight -= 1
                 if phase_issuer.inflight <= 0:
                     self._drain_event.set()
                 if self._current_strategy:
                     self._current_strategy.on_query_complete(query_id)
-                if self._on_sample_complete:
+                if (
+                    self._on_sample_complete
+                    and self._current_phase_type != PhaseType.WARMUP
+                ):
                     self._on_sample_complete(resp)
 
         elif isinstance(resp, StreamChunk):
@@ -454,11 +563,18 @@ class BenchmarkSession:
                 if is_first
                 else SampleEventType.RECV_NON_FIRST
             )
+            conv_id_str, turn_num = ("", None)
+            if phase_issuer is not None:
+                conv_id_str, turn_num = phase_issuer.uuid_to_conv_info.get(
+                    resp.id, ("", None)
+                )
             self._publisher.publish(
                 EventRecord(
                     event_type=event_type,
                     timestamp_ns=time.monotonic_ns(),
                     sample_uuid=resp.id,
+                    conversation_id=conv_id_str,
+                    turn=turn_num,
                 )
             )
 
