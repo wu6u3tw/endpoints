@@ -23,6 +23,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import time
 import uuid
 from collections.abc import Callable
@@ -445,18 +446,21 @@ class BenchmarkSession:
     async def _drain_inflight(self, phase_issuer: PhaseIssuer) -> None:
         """Wait for all in-flight responses from this phase to complete.
 
-        Hard-bounded at 240 s; logs an error and returns if exceeded so the
-        next phase starts regardless of stuck requests."""
+        Timeout defaults to 240 s; override via INFERENCE_ENDPOINT_DRAIN_TIMEOUT
+        (seconds). Needed for multi-minute samples like video generation, where
+        the default cuts the phase off before steady-state samples land."""
         if phase_issuer.inflight <= 0 or self._stop_requested:
             return
+        drain_timeout = float(os.environ.get("INFERENCE_ENDPOINT_DRAIN_TIMEOUT", "240"))
         logger.info("Draining %d in-flight responses...", phase_issuer.inflight)
         self._drain_event.clear()
         try:
-            await asyncio.wait_for(self._drain_event.wait(), timeout=240.0)
+            await asyncio.wait_for(self._drain_event.wait(), timeout=drain_timeout)
         except TimeoutError:
             logger.error(
-                "Drain timed out after 240 s with %d responses still in flight; "
+                "Drain timed out after %.0f s with %d responses still in flight; "
                 "proceeding to next phase.",
+                drain_timeout,
                 phase_issuer.inflight,
             )
 
