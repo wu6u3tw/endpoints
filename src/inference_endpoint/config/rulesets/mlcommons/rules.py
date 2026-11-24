@@ -290,8 +290,19 @@ _v6_1 = RoundRuleset(
     benchmark_rulesets={
         # Keep the model-singleton keys; deep-copy only the per-model rules so
         # v6.1's mutable leaves (e.g. reported_metrics) can't leak into v5.1.
-        model: copy.deepcopy(rules)
-        for model, rules in _v5_1.benchmark_rulesets.items()
+        **{
+            model: copy.deepcopy(rules)
+            for model, rules in _v5_1.benchmark_rulesets.items()
+        },
+        # MLPerf Inference text_to_video: a video model has no token latencies,
+        # so the per-query ruleset carries only the 50-sample performance floor
+        # (the accuracy run still covers all 248 prompts).
+        models.Wan2_2_T2V_A14B: {
+            OptimizationPriority.THROUGHPUT: PerQueryRuleset(
+                min_sample_count_valid=50,
+                reported_metrics=[],
+            )
+        },
     },
 )
 

@@ -13,8 +13,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from pathlib import Path
+
+import inference_endpoint
 import pytest
 from inference_endpoint import metrics
+from inference_endpoint.compliance.checker import _resolve_model
 from inference_endpoint.config.ruleset_registry import (
     get_ruleset,
     list_rulesets,
@@ -38,6 +42,7 @@ from inference_endpoint.config.schema import (
     TestType,
 )
 from inference_endpoint.config.user_config import UserConfig
+from inference_endpoint.validation.catalog import Catalog
 
 
 @pytest.mark.unit
@@ -172,10 +177,18 @@ def test_register_ruleset_rejects_duplicate():
 
 @pytest.mark.unit
 def test_v6_1_latency_targets_match_v5_1():
-    """Only the round seeds rotate; per-model targets are identical."""
+    """The round seeds rotate; v5.1's per-model targets carry over unchanged.
+
+    v6.1 adds the text_to_video model on top (see
+    test_t2v_model_is_in_the_v6_1_round).
+    """
     v5_1 = get_ruleset("mlperf-inference-v5.1")
     v6_1 = get_ruleset("mlperf-inference-v6.1")
-    assert v6_1.benchmark_rulesets == v5_1.benchmark_rulesets
+    carried = {
+        m: r for m, r in v6_1.benchmark_rulesets.items() if m in v5_1.benchmark_rulesets
+    }
+    assert carried == v5_1.benchmark_rulesets
+    assert set(v6_1.benchmark_rulesets) - set(carried) == {models.Wan2_2_T2V_A14B}
     # v6.1 holds an independent copy, not a shared reference to v5.1's dict.
     assert v6_1.benchmark_rulesets is not v5_1.benchmark_rulesets
     # Anchor on a concrete target so the equality above verifies real structure.
@@ -213,6 +226,46 @@ def test_edge_model_accuracy_gate():
     (overall_factor,) = settings["bfcl_overall_accuracy"]
     assert overall_factor == 0.97
     assert golden["bfcl_overall_accuracy"] * overall_factor == pytest.approx(83.6431)
+
+
+@pytest.mark.unit
+def test_t2v_model_accuracy_gate():
+    model = models.Wan2_2_T2V_A14B
+    assert model.name == "wan-2.2-t2v-a14b"
+    assert model.dataset is datasets.Wan22T2VPrompts
+    assert model.dataset.size == 248
+    assert model.dataset.metadata["scorer"] == "vbench"
+
+    precision, golden = model.golden_accuracy
+    assert precision == "bf16"
+    (settings,) = model.accuracy_target_settings
+    (factor,) = settings["vbench_score"]
+    # MLPerf Inference text_to_video gate: 99% of the BF16 reference.
+    assert golden["vbench_score"] * factor == pytest.approx(69.7752)
+
+
+@pytest.mark.unit
+def test_t2v_model_is_in_the_v6_1_round():
+    ruleset = get_ruleset("mlperf-inference-v6.1")
+    model = _resolve_model(ruleset, "wan-2.2-t2v-a14b")
+    assert model is models.Wan2_2_T2V_A14B
+    rules = ruleset.benchmark_rulesets[model][OptimizationPriority.THROUGHPUT]
+    assert rules.min_sample_count_valid == 50
+    assert model not in get_ruleset("mlperf-inference-v5.1").benchmark_rulesets
+
+
+@pytest.mark.unit
+def test_the_checker_catalog_and_the_round_agree_on_the_t2v_gate():
+    # Two copies by necessity (the round drives the client's compliance check,
+    # the cohort catalog the submission checker); pin them to each other.
+    cohort = Path(inference_endpoint.__file__).parent / "config" / "cohorts"
+    catalog = Catalog.from_directory(cohort / "2026-10-C1" / "ruleset")
+    _, golden = models.Wan2_2_T2V_A14B.golden_accuracy
+    (settings,) = models.Wan2_2_T2V_A14B.accuracy_target_settings
+    (factor,) = settings["vbench_score"]
+    assert catalog.accuracy_gates("wan-2.2-t2v-a14b") == {
+        "wan22_vbench": pytest.approx(golden["vbench_score"] * factor)
+    }
 
 
 @pytest.mark.unit
