@@ -29,16 +29,17 @@ class TestVideoPathRequest:
     def test_defaults(self):
         req = VideoPathRequest(prompt="a cat")
         assert req.negative_prompt is None
-        assert req.latent_path is None
-        assert req.size == "720x1280"
+        assert "latent_path" not in VideoPathRequest.model_fields
+        assert req.size == "1280x720"
         assert req.seconds == pytest.approx(5.0)
         assert req.fps == 16
         assert req.num_inference_steps == 20
         assert req.guidance_scale == pytest.approx(4.0)
-        assert req.guidance_scale_2 == pytest.approx(3.0)
+        assert req.extra_params.guidance_scale_2 == pytest.approx(3.0)
+        assert req.extra_params.boundary_ratio == pytest.approx(0.875)
         assert req.seed == 42
-        assert req.output_format == "auto"
-        assert req.response_format == "video_path"
+        assert req.format == "auto"
+        assert req.response_format == "path"
 
     @pytest.mark.unit
     def test_custom_values(self):
@@ -57,14 +58,20 @@ class TestVideoPathRequest:
         assert req.num_inference_steps == 50
 
     @pytest.mark.unit
-    def test_response_format_video_bytes(self):
-        req = VideoPathRequest(prompt="test", response_format="video_bytes")
-        assert req.response_format == "video_bytes"
+    def test_response_format_file(self):
+        req = VideoPathRequest(prompt="test", response_format="file")
+        assert req.response_format == "file"
 
     @pytest.mark.unit
-    def test_invalid_output_format_rejected(self):
+    def test_unknown_extra_param_rejected(self):
+        # trtllm-serve answers any other extra_params key with HTTP 400.
         with pytest.raises(ValidationError):
-            VideoPathRequest(prompt="test", output_format="invalid")
+            VideoPathRequest(prompt="test", extra_params={"latent_path": "x"})
+
+    @pytest.mark.unit
+    def test_invalid_format_rejected(self):
+        with pytest.raises(ValidationError):
+            VideoPathRequest(prompt="test", format="invalid")
 
     @pytest.mark.unit
     def test_invalid_response_format_rejected(self):

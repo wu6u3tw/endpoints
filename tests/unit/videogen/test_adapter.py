@@ -17,14 +17,24 @@
 
 import json
 
+import pandas as pd
 import pytest
 from inference_endpoint.config.schema import ModelParams
 from inference_endpoint.core.types import APIType, Query, QueryResult, TextModelOutput
+from inference_endpoint.dataset_manager.transforms import (
+    ColumnFilter,
+    RejectColumns,
+    apply_transforms,
+)
 from inference_endpoint.endpoint_client.accumulator_protocol import (
     SSEAccumulatorProtocol,
 )
 from inference_endpoint.videogen.adapter import VideoGenAccumulator, VideoGenAdapter
-from inference_endpoint.videogen.types import VideoPathResponse, VideoPayloadResponse
+from inference_endpoint.videogen.types import (
+    VideoPathRequest,
+    VideoPathResponse,
+    VideoPayloadResponse,
+)
 
 
 @pytest.mark.unit
@@ -38,26 +48,37 @@ class TestVideoGenAdapter:
         """Perf mode default — server saves to Lustre, returns path only."""
         query = Query(id="q1", data={"prompt": "ocean waves"})
         payload = json.loads(VideoGenAdapter.encode_query(query, include_usage=False))
-        assert payload["response_format"] == "video_path"
+        assert payload["response_format"] == "path"
 
-    def test_encode_query_accuracy_mode_requests_video_bytes(self):
-        """Accuracy mode override — query.data opts in to inline bytes."""
+    def test_encode_query_accuracy_mode_requests_the_file(self):
+        """Accuracy mode override: query.data opts in to the video file."""
         query = Query(
-            id="q1", data={"prompt": "ocean waves", "response_format": "video_bytes"}
+            id="q1", data={"prompt": "ocean waves", "response_format": "file"}
         )
         payload = json.loads(VideoGenAdapter.encode_query(query, include_usage=False))
-        assert payload["response_format"] == "video_bytes"
+        assert payload["response_format"] == "file"
 
     def test_encode_query_uses_mlperf_defaults(self):
         query = Query(id="q1", data={"prompt": "ocean waves"})
         payload = json.loads(VideoGenAdapter.encode_query(query, include_usage=False))
         assert payload["fps"] == 16
         assert payload["seconds"] == pytest.approx(5.0)
-        assert payload["size"] == "720x1280"
+        assert payload["size"] == "1280x720"
         assert payload["num_inference_steps"] == 20
         assert payload["guidance_scale"] == pytest.approx(4.0)
-        assert payload["guidance_scale_2"] == pytest.approx(3.0)
+        assert payload["extra_params"] == {
+            "guidance_scale_2": pytest.approx(3.0),
+            "boundary_ratio": pytest.approx(0.875),
+        }
+        assert payload["format"] == "auto"
         assert payload["seed"] == 42
+
+    def test_the_wire_is_the_request_as_dumped(self):
+        # VideoPathRequest mirrors trtllm-serve's schema: no client-only names.
+        query = Query(id="q1", data={"prompt": "test"})
+        payload = json.loads(VideoGenAdapter.encode_query(query, include_usage=False))
+        expected = VideoPathRequest(prompt="test").model_dump(exclude_none=True)
+        assert payload == expected
 
     def test_encode_query_allows_override_via_data(self):
         query = Query(
@@ -80,17 +101,20 @@ class TestVideoGenAdapter:
         payload = json.loads(VideoGenAdapter.encode_query(query, include_usage=False))
         assert "negative_prompt" not in payload
 
-    def test_encode_query_includes_latent_path(self):
+    def test_encode_query_ignores_latent_path(self):
+        # The fixed latent is a server input; a stray key never reaches the wire
+        # (the dataset load refuses the column, see test_dataset_rejects_latent_path).
         query = Query(
-            id="q1", data={"prompt": "test", "latent_path": "/lustre/fixed_latent.pt"}
+            id="q1", data={"prompt": "test", "latent_path": "/data/fixed_latent.pt"}
         )
         payload = json.loads(VideoGenAdapter.encode_query(query, include_usage=False))
-        assert payload["latent_path"] == "/lustre/fixed_latent.pt"
+        assert "latent_path" not in payload
 
     def test_encode_query_omits_latent_path_when_absent(self):
         query = Query(id="q1", data={"prompt": "test"})
         payload = json.loads(VideoGenAdapter.encode_query(query, include_usage=False))
         assert "latent_path" not in payload
+        assert "latent_path" not in payload.get("extra_params", {})
 
     def test_encode_query_missing_prompt_raises(self):
         query = Query(id="q1", data={"seed": 42})
@@ -153,6 +177,42 @@ class TestVideoGenAdapter:
         assert result.response_output == TextModelOutput(output=str(out))
         assert result.metadata == {"video_id": "qbin", "video_path": str(out)}
 
+    def test_decode_response_avi_binary_writes_fallback(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("INFERENCE_ENDPOINT_VIDEOGEN_FALLBACK_DIR", str(tmp_path))
+        body = b"RIFF\x00\x00\x00\x00AVI LIST" + b"\x00" * 16
+        result = VideoGenAdapter.decode_response(body, "qavi")
+        assert (tmp_path / "qavi.avi").read_bytes() == body
+        assert result.metadata["video_path"] == str(tmp_path / "qavi.avi")
+
+    def test_decode_response_maps_server_path_envelope(self):
+        body = json.dumps({"id": "video_1", "output_path": "/out/v.mp4"}).encode()
+        result = VideoGenAdapter.decode_response(body, "q1")
+        assert result.metadata == {"video_id": "video_1", "video_path": "/out/v.mp4"}
+        assert result.response_output == TextModelOutput(output="/out/v.mp4")
+
+    def test_decode_response_uses_first_output_paths_entry(self):
+        body = json.dumps(
+            {
+                "id": "video_2",
+                "status": "completed",
+                "output_paths": ["/a.mp4", "/b.mp4"],
+            }
+        ).encode()
+        result = VideoGenAdapter.decode_response(body, "q2")
+        assert result.metadata["video_path"] == "/a.mp4"
+
+    @pytest.mark.parametrize(
+        "job, match",
+        [
+            ({"id": "v", "error": "boom"}, "error"),
+            ({"id": "v", "status": "failed", "output_path": "/x"}, "not completed"),
+            ({"id": "v", "status": "completed"}, "no output_path"),
+        ],
+    )
+    def test_decode_response_rejects_unusable_server_job(self, job, match):
+        with pytest.raises(ValueError, match=match):
+            VideoGenAdapter.decode_response(json.dumps(job).encode(), "q3")
+
     def test_decode_response_binary_without_env_raises(self, monkeypatch):
         monkeypatch.delenv("INFERENCE_ENDPOINT_VIDEOGEN_FALLBACK_DIR", raising=False)
         body = b"\x00\x00\x00\x20ftypisom" + b"\x00" * 16
@@ -165,19 +225,26 @@ class TestVideoGenAdapter:
         with pytest.raises(NotImplementedError):
             VideoGenAdapter.decode_sse_message(b"{}")
 
-    def test_dataset_transforms_returns_column_filter(self):
-        from inference_endpoint.dataset_manager.transforms import ColumnFilter
-        from inference_endpoint.videogen.types import VideoPathRequest
-
+    def test_dataset_transforms_reject_latent_then_filter(self):
         params = ModelParams()
         transforms = VideoGenAdapter.dataset_transforms(params)
-        assert len(transforms) == 1
-        cf = transforms[0]
-        assert isinstance(cf, ColumnFilter)
+        assert [type(t) for t in transforms] == [RejectColumns, ColumnFilter]
+        assert set(transforms[0].reasons) == {"latent_path"}
+        cf = transforms[1]
         assert cf.required_columns == ["prompt"]
         # Optional columns mirror VideoPathRequest fields except prompt itself.
         expected_optional = {f for f in VideoPathRequest.model_fields if f != "prompt"}
         assert set(cf.optional_columns or []) == expected_optional
+
+    def test_dataset_rejects_latent_path(self):
+        df = pd.DataFrame([{"prompt": "a cat", "latent_path": "/data/fixed_latent.pt"}])
+        with pytest.raises(ValueError, match="fixed_latent_sha256"):
+            apply_transforms(df, VideoGenAdapter.dataset_transforms(ModelParams()))
+
+    def test_dataset_without_latent_path_loads(self):
+        df = pd.DataFrame([{"prompt": "a cat", "seed": 42}])
+        out = apply_transforms(df, VideoGenAdapter.dataset_transforms(ModelParams()))
+        assert set(out.columns) == {"prompt", "seed"}
 
     def test_default_route_is_trtllm_native(self):
         assert APIType.VIDEOGEN.default_route() == "v1/videos/generations"

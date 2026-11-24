@@ -112,6 +112,7 @@ from inference_endpoint.load_generator.session import (
 )
 from inference_endpoint.metrics.report import Report
 from inference_endpoint.openai.types import requests_multiple_choices
+from inference_endpoint.videogen.adapter import VideoGenAdapter
 
 if TYPE_CHECKING:
     from inference_endpoint.async_utils.event_publisher import EventPublisherService
@@ -356,6 +357,32 @@ def _check_multi_choice_rows(
         )
 
 
+def _check_submission_generation(config: BenchmarkConfig, ds: Dataset) -> None:
+    """Refuse a video dataset that overrides reference-fixed settings in a submission run.
+
+    A run bound to a `submission_ref` generates what the reference fixes
+    (frames, steps, size, ...): the checker credits each clip with the
+    catalog's frames per sample, so a prompt row that changes them would be
+    scored for frames it never made.
+
+    Raises:
+        InputValidationError: When the dataset sets a locked field.
+    """
+    if config.submission_ref is None:
+        return
+    if config.endpoint_config.api_type != APIType.VIDEOGEN:
+        return
+    df = ds.dataframe
+    columns = list(df.columns) if df is not None else []
+    overrides = VideoGenAdapter.submission_overrides(columns)
+    if overrides:
+        raise InputValidationError(
+            f"Dataset '{ds}' sets {', '.join(overrides)} per prompt; a submission "
+            "run (submission_ref) generates with the reference settings, so "
+            "remove these columns."
+        )
+
+
 def _load_datasets(
     config: BenchmarkConfig,
     report_dir: Path,
@@ -411,6 +438,7 @@ def _load_datasets(
         # so this cannot raise for a validated config.
         ds_model_params = acc_cfg.effective_generation_config(config.model_params)
         ds.load(api_type=config.endpoint_config.api_type, model_params=ds_model_params)
+        _check_submission_generation(config, ds)
         logger.info(f"Loaded {ds} - {ds.num_samples()} samples")
         scorer_cls.preflight(extras)
         # TODO add tests and defaults
@@ -464,6 +492,7 @@ def _load_datasets(
             ) from e
         except Exception as e:
             raise SetupError(f"Failed to load dataset: {e}") from e
+        _check_submission_generation(config, dataloader)
 
         # Fail fast on a warmup dataset that salt cannot bust — at load time,
         # before any worker/aggregator subprocess is spawned. with_salt() runs
@@ -569,7 +598,16 @@ def setup_benchmark(
     model_name = config.model_params.name
     tokenizer_override = config.model_params.tokenizer_name
     tokenizer_name: str | None
-    if tokenizer_override:
+    if config.endpoint_config.api_type == APIType.VIDEOGEN:
+        # A video response carries a file path in response_output (VBench reads
+        # it there), so tokenizing it would report OSL and TPS of a path string.
+        if tokenizer_override:
+            raise SetupError(
+                f"Tokenizer override '{tokenizer_override}' is not supported for "
+                "api_type videogen: video responses carry no tokens."
+            )
+        tokenizer_name = None
+    elif tokenizer_override:
         if not _check_tokenizer_exists(tokenizer_override):
             raise SetupError(
                 f"Tokenizer override '{tokenizer_override}' could not be verified. "

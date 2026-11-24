@@ -268,6 +268,42 @@ class ColumnFilter(Transform):
         return df
 
 
+class RejectColumns(Transform):
+    """Transform that refuses a DataFrame carrying any of the named columns.
+
+    ColumnFilter drops a column it does not list, so a column that must never
+    reach the endpoint would vanish silently. This transform fails the load
+    instead, with the reason for each column.
+    """
+
+    def __init__(self, reasons: dict[str, str]):
+        """Initialize the RejectColumns transform.
+
+        Args:
+            reasons: Column name to the message raised when the column is present.
+        """
+        self.reasons = reasons
+
+    def __call__(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Return `df` unchanged, or raise if it carries a rejected column.
+
+        Args:
+            df: Input DataFrame
+
+        Returns:
+            The same DataFrame.
+
+        Raises:
+            ValueError: If a rejected column is present.
+        """
+        found = [name for name in self.reasons if name in df.columns]
+        if found:
+            raise ValueError(
+                "; ".join(f"column '{name}': {self.reasons[name]}" for name in found)
+            )
+        return df
+
+
 class ColumnRemap(Transform):
     """Remaps columns in a DataFrame. This Transform is has an added feature on top of the
     normal dataframe.rename() method in that rather than remapping an old column name to a new

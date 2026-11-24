@@ -337,8 +337,17 @@ class Worker:
                     if query is None:
                         break
 
-                    # Prepare and fire request
-                    req = self._prepare_request(query)
+                    # Prepare and fire request. An encode failure is the
+                    # query's error result, so the issuer releases its slot.
+                    try:
+                        req = self._prepare_request(query)
+                    except Exception as e:
+                        logger.error(
+                            f"Request {query.id} could not be encoded: "
+                            f"{type(e).__name__}: {e}"
+                        )
+                        await self._handle_error(query.id, e)
+                        continue
                     if not await self._fire_request(req):
                         continue
 

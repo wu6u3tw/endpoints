@@ -15,7 +15,6 @@
 
 """Integration tests: VideoGenAdapter encode/decode round-trip against mock trtllm-serve."""
 
-import base64
 import json
 import urllib.request
 from urllib.error import HTTPError
@@ -54,7 +53,7 @@ class TestVideoGenAdapterRoundTrip:
     def test_perf_mode_round_trip_returns_video_path(
         self, mock_trtllm_serve: MockTrtllmServe
     ) -> None:
-        """Default response_format=video_path → server returns the saved-video path."""
+        """Default response_format=path: the server returns the saved-video path."""
         query = Query(id="q1", data={"prompt": "a golden retriever running on a beach"})
         request_bytes = VideoGenAdapter.encode_query(query, include_usage=False)
 
@@ -72,15 +71,16 @@ class TestVideoGenAdapterRoundTrip:
         assert result.metadata["video_path"] == mock_trtllm_serve.video_path
         assert isinstance(result.metadata["video_id"], str)
 
-    def test_accuracy_mode_round_trip_returns_video_bytes(
-        self, mock_trtllm_serve: MockTrtllmServe
+    def test_accuracy_mode_round_trip_saves_video_file(
+        self, mock_trtllm_serve: MockTrtllmServe, tmp_path, monkeypatch
     ) -> None:
-        """response_format=video_bytes → server returns base64 payload inline."""
+        """response_format=file: the server returns the file; it is saved."""
+        monkeypatch.setenv("INFERENCE_ENDPOINT_VIDEOGEN_FALLBACK_DIR", str(tmp_path))
         query = Query(
             id="q1b",
             data={
                 "prompt": "a golden retriever running on a beach",
-                "response_format": "video_bytes",
+                "response_format": "file",
             },
         )
         request_bytes = VideoGenAdapter.encode_query(query, include_usage=False)
@@ -93,27 +93,26 @@ class TestVideoGenAdapterRoundTrip:
         result = VideoGenAdapter.decode_response(content, query.id)
         assert result.id == "q1b"
         assert result.error is None
-        assert result.response_output is None
-        assert isinstance(result.metadata["video_id"], str)
-        decoded = base64.b64decode(result.metadata["video_bytes"])
-        assert decoded == DUMMY_VIDEO_BYTES
+        saved = tmp_path / "q1b.mp4"
+        assert saved.read_bytes() == DUMMY_VIDEO_BYTES
+        assert result.metadata["video_path"] == str(saved)
 
     def test_request_default_response_format_is_video_path(
         self, mock_trtllm_serve: MockTrtllmServe
     ) -> None:
         query = Query(id="q2", data={"prompt": "ocean waves at sunset"})
         payload = json.loads(VideoGenAdapter.encode_query(query, include_usage=False))
-        assert payload["response_format"] == "video_path"
+        assert payload["response_format"] == "path"
 
-    def test_request_accuracy_mode_asks_for_video_bytes(
+    def test_request_accuracy_mode_asks_for_the_file(
         self, mock_trtllm_serve: MockTrtllmServe
     ) -> None:
         query = Query(
             id="q2b",
-            data={"prompt": "ocean waves at sunset", "response_format": "video_bytes"},
+            data={"prompt": "ocean waves at sunset", "response_format": "file"},
         )
         payload = json.loads(VideoGenAdapter.encode_query(query, include_usage=False))
-        assert payload["response_format"] == "video_bytes"
+        assert payload["response_format"] == "file"
 
     def test_request_carries_mlperf_defaults(
         self, mock_trtllm_serve: MockTrtllmServe
@@ -122,7 +121,7 @@ class TestVideoGenAdapterRoundTrip:
         payload = json.loads(VideoGenAdapter.encode_query(query, include_usage=False))
         assert payload["fps"] == 16
         assert payload["seconds"] == pytest.approx(5.0)
-        assert payload["size"] == "720x1280"
+        assert payload["size"] == "1280x720"
         assert payload["num_inference_steps"] == 20
         assert payload["guidance_scale"] == pytest.approx(4.0)
         assert payload["seed"] == 42

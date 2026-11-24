@@ -143,3 +143,28 @@ async def test_opted_out_worker_never_logs_opt_out_hint(monkeypatch, caplog):
     )
     (error,) = (c.args[0] for c in worker._responses.send.call_args_list)
     assert error.id == "q0" and error.error is not None
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_encode_failure_is_the_query_error_result(monkeypatch):
+    # A query the adapter cannot encode must come back as a failed sample;
+    # a lost query would hold its concurrency slot until the run times out.
+    monkeypatch.setattr(
+        OpenAIMsgspecAdapter, "encode_query", MagicMock(side_effect=ValueError("bad"))
+    )
+    worker = _worker()
+    requests = MagicMock()
+    requests.recv = AsyncMock(side_effect=[Query(id="q0", data={"prompt": "hi"}), None])
+    responses = MagicMock()
+    connection = MagicMock()
+    connection.__aenter__ = AsyncMock(return_value=(requests, responses))
+    connection.__aexit__ = AsyncMock(return_value=False)
+    worker._connector.connect = MagicMock(return_value=connection)
+
+    await worker._run_main_loop()
+
+    (error,) = (c.args[0] for c in responses.send.call_args_list)
+    assert error.id == "q0"
+    assert error.error.error_type == "ValueError"
+    worker._pool.acquire.assert_not_called()

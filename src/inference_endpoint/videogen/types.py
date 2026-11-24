@@ -20,15 +20,40 @@ from typing import Literal
 from pydantic import BaseModel, ConfigDict, Field
 
 
+class VideoExtraParams(BaseModel):
+    """`extra_params` of the request: the Wan 2.2 A14B settings trtllm-serve accepts.
+
+    The server answers any other key with HTTP 400, so the model forbids them.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    guidance_scale_2: float = Field(
+        default=3.0,
+        description="Secondary guidance scale for null-text CFG (MLPerf: 3.0).",
+    )
+    boundary_ratio: float = Field(
+        default=0.875,
+        description=(
+            "Boundary ratio in [0, 1] that switches CFG from guidance_scale to "
+            "guidance_scale_2 once the timestep crosses boundary_ratio * "
+            "num_train_timesteps (MLPerf: 0.875)."
+        ),
+    )
+
+
 class VideoPathRequest(BaseModel):
     """Request body for POST /v1/videos/generations.
 
-    Matches trtllm-serve's VideoGenerationRequest. All fields have MLPerf defaults
-    so that only `prompt` is required from the dataset.
+    Field for field the trtllm-serve VideoGenerationRequest wire schema (it
+    forbids unknown fields, HTTP 422), so the request is sent as dumped. All
+    fields have MLPerf defaults so that only `prompt` is required from the
+    dataset.
 
-    `response_format` defaults to "video_path"; callers wanting accuracy-mode
-    behaviour must inject `response_format="video_bytes"` into `query.data`
-    via the dataset (the adapter does not derive it from `benchmark_mode`).
+    `response_format` defaults to "path" (the server saves the video and
+    returns its path); a dataset that sets `response_format="file"` gets the
+    video file back instead (the adapter does not derive it from
+    `benchmark_mode`).
     """
 
     prompt: str
@@ -41,7 +66,10 @@ class VideoPathRequest(BaseModel):
             "prompt per row."
         ),
     )
-    size: str = Field(default="720x1280", description="Frame size in 'WxH' format.")
+    size: str = Field(
+        default="1280x720",
+        description="Frame size in 'WxH' format (MLPerf: 720p landscape).",
+    )
     seconds: float = Field(
         default=5.0,
         description="Video duration. 81 frames @ ~16.2 fps = 5 s (MLPerf standard).",
@@ -53,38 +81,21 @@ class VideoPathRequest(BaseModel):
     guidance_scale: float = Field(
         default=4.0, description="CFG guidance scale (MLPerf: 4.0)."
     )
-    guidance_scale_2: float = Field(
-        default=3.0,
-        description="Secondary guidance scale for null-text CFG (MLPerf: 3.0).",
-    )
     seed: int = Field(default=42, description="Random seed (MLPerf: 42).")
     num_frames: int = Field(
         default=81,
         description="Total video frames. 81 frames @ ~16.2 fps = 5 s (MLPerf: 81).",
     )
-    boundary_ratio: float = Field(
-        default=0.875,
-        description=(
-            "Boundary ratio in [0, 1] that switches CFG from guidance_scale to "
-            "guidance_scale_2 once the timestep crosses boundary_ratio * "
-            "num_train_timesteps (MLPerf: 0.875)."
-        ),
+    extra_params: VideoExtraParams = Field(
+        default_factory=lambda: VideoExtraParams(),
+        description="Model-specific parameters (Wan 2.2 A14B's two-stage CFG).",
     )
-    latent_path: str | None = Field(
-        default=None,
-        description=(
-            "Absolute path to a pre-computed latent tensor (.pt file) on shared "
-            "storage accessible to the server (e.g. Lustre). When provided, the "
-            "server uses this tensor as the initial denoising noise instead of "
-            "sampling random noise. MLPerf uses a fixed latent for reproducibility."
-        ),
-    )
-    output_format: Literal["mp4", "avi", "auto"] = "auto"
-    response_format: Literal["video_bytes", "video_path"] = "video_path"
+    format: Literal["mp4", "avi", "auto"] = "auto"
+    response_format: Literal["path", "file"] = "path"
 
 
 class VideoPathResponse(BaseModel):
-    """Response body from trtllm-serve when response_format='video_path'.
+    """A path response (response_format="path"), after the adapter maps the envelope.
 
     The server saves the encoded video to its local filesystem (e.g. Lustre)
     and returns the absolute path instead of video bytes.
@@ -102,11 +113,7 @@ class VideoPathResponse(BaseModel):
 
 
 class VideoPayloadResponse(BaseModel):
-    """Response body from trtllm-serve when response_format='video_bytes'.
-
-    Used in accuracy mode. video_bytes is the base64-encoded video content,
-    which the accuracy evaluator decodes to score quality (e.g. FVD).
-    """
+    """Response body with the video inline as base64."""
 
     model_config = ConfigDict(extra="forbid")
 
