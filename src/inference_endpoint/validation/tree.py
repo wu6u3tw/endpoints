@@ -84,6 +84,17 @@ FILE_TO_KEY_MAP = {
 _CLIENT_TPS_KEY: Final = "tps"
 _POLICY_TPS_KEY: Final = "system_tps"
 _FULL_RUN_TPS_KEY: Final = "full_run_system_tps"
+# A video benchmark's aggregate throughput, in frames per second: `system_fps`
+# is the official reading, `full_run_system_fps` the whole-run value (the same
+# number: no steady window applies without token streams).
+_POLICY_FPS_KEY: Final = "system_fps"
+_FULL_RUN_FPS_KEY: Final = "full_run_system_fps"
+_THROUGHPUT_KEYS: Final = (
+    _POLICY_TPS_KEY,
+    _FULL_RUN_TPS_KEY,
+    _POLICY_FPS_KEY,
+    _FULL_RUN_FPS_KEY,
+)
 
 
 def _steady_tps(value: Mapping[str, Any]) -> Any:
@@ -108,14 +119,21 @@ def _with_system_tps(value: Any) -> Any:
     one carrying the client's `tps` gains `system_tps` (the §4.4 official
     reading: the steady window's TPS where `steady_state.window` holds, the
     whole-run value otherwise) and `full_run_system_tps` (the whole-run value,
-    always), and a non-mapping is left for its own refusal to name.
+    always), and a non-mapping is left for its own refusal to name. Every
+    summary also gains `n_samples_succeeded` (`_with_succeeded`).
+
+    A video benchmark is not read here: it is measured in frames
+    (`_with_system_fps`).
 
     Args:
         value (Any): One `result_summary.json` document, as parsed.
     Returns:
         Any: The document, or a copy carrying the policy names.
     """
-    if not isinstance(value, Mapping) or _CLIENT_TPS_KEY not in value:
+    if not isinstance(value, Mapping):
+        return value
+    value = _with_succeeded(value)
+    if _CLIENT_TPS_KEY not in value:
         return value
     whole = value[_CLIENT_TPS_KEY]
     aliases: dict[str, Any] = {}
@@ -127,6 +145,154 @@ def _with_system_tps(value: Any) -> Any:
     if _FULL_RUN_TPS_KEY not in value and whole is not None:
         aliases[_FULL_RUN_TPS_KEY] = whole
     return {**value, **aliases} if aliases else value
+
+
+_SUCCEEDED_KEY: Final = "n_samples_succeeded"
+
+
+def _is_number(value: Any) -> bool:
+    return isinstance(value, int | float) and not isinstance(value, bool)
+
+
+def _with_succeeded(value: Mapping[str, Any]) -> Mapping[str, Any]:
+    """`value` with `n_samples_succeeded = n_samples_completed - n_samples_failed`.
+
+    The client counts a failed sample as completed (`metrics/report.py`), so
+    the successes are the difference. Always the checker's own value: an
+    uploaded `n_samples_succeeded` is replaced, and dropped when either count
+    is missing.
+    """
+    completed = value.get("n_samples_completed")
+    failed = value.get("n_samples_failed")
+    rest = {k: v for k, v in value.items() if k != _SUCCEEDED_KEY}
+    if isinstance(completed, int) and isinstance(failed, int):
+        if not isinstance(completed, bool) and not isinstance(failed, bool):
+            return {**rest, _SUCCEEDED_KEY: completed - failed}
+    return rest
+
+
+def _with_system_fps(value: Any, frames_per_sample: float) -> Any:
+    """A video run's summary with its frame rate as `system_fps`.
+
+    A video benchmark answers with a file, not tokens: its unit of output is a
+    frame (the catalog's `frames_per_sample`). The throughput is the successful
+    clips' frames over the run window,
+    `qps x (n_samples_succeeded / n_samples_completed) x frames_per_sample`
+    (`qps` counts failed samples too, so it is scaled to the successes). No
+    steady window applies (it needs token streams), so the whole-run value is
+    the official reading. The checker's value always replaces an uploaded one,
+    and an uploaded `system_tps` is dropped: a video run has no token rate. A
+    summary without the counts gets no `system_fps`, so the missing value is
+    refused at load (`Point.from_node`). A non-mapping is left for its own
+    refusal to name.
+    """
+    if not isinstance(value, Mapping):
+        return value
+    value = _with_succeeded(value)
+    rest = {k: v for k, v in value.items() if k not in _THROUGHPUT_KEYS}
+    qps = value.get("qps")
+    completed = value.get("n_samples_completed")
+    succeeded = value.get(_SUCCEEDED_KEY)
+    if not isinstance(qps, int | float) or isinstance(qps, bool):
+        return rest
+    if not isinstance(succeeded, int) or not isinstance(completed, int):
+        return rest
+    if completed <= 0:
+        return rest
+    rate = qps * succeeded / completed * frames_per_sample
+    return {**rest, _POLICY_FPS_KEY: rate, _FULL_RUN_FPS_KEY: rate}
+
+
+_SCORE_BY_DATASET_KEY: Final = "score_by_dataset"
+_GATES_KEY: Final = "gates"
+_GATES_UNMET_KEY: Final = "gates_unmet"
+_GATES_CHECKED_KEY: Final = "gates_checked"
+# Keys the checker writes into the accuracy view; an upload never sets them.
+_ACCURACY_VIEW_KEYS: Final = (
+    _SCORE_BY_DATASET_KEY,
+    _GATES_KEY,
+    _GATES_UNMET_KEY,
+    _GATES_CHECKED_KEY,
+)
+
+
+def _with_score_by_dataset(value: Any, gates: Mapping[str, float] | None = None) -> Any:
+    """`value` with each accuracy set's score and gate under the set's name.
+
+    The row dialect cannot look into a list by a member's name, so the checker
+    builds the per-set view itself:
+
+    - `score_by_dataset.<set>`: the set's score from `accuracy_scores`. A set
+      named twice is left out (no order of entries decides a gate).
+    - `gates.<set>`: `{gate, score, met}` for each set the catalog gates
+      (`Catalog.accuracy_gates`), with `gates_unmet` (the sets below their
+      gate, or without a score) and `gates_checked` (how many were gated).
+
+    These keys are always the checker's own: an upload that carries any of
+    them reads as unscored, so no gate can pass on an uploaded value.
+
+    Args:
+        value (Any): One `accuracy_results.json` document, as parsed.
+        gates (Mapping[str, float] | None): Set name to its gate, from the
+            catalog. (Default: None)
+    Returns:
+        Any: The document, or a copy carrying the checker's view.
+    """
+    if not isinstance(value, Mapping):
+        return value
+    forged = any(key in value for key in _ACCURACY_VIEW_KEYS)
+    rest = {k: v for k, v in value.items() if k not in _ACCURACY_VIEW_KEYS}
+    entries = value.get("accuracy_scores")
+    scores: dict[str, float] = {}
+    if isinstance(entries, list) and not forged:
+        named = [
+            entry
+            for entry in entries
+            if isinstance(entry, Mapping) and isinstance(entry.get("dataset_name"), str)
+        ]
+        counts: dict[str, int] = {}
+        for entry in named:
+            counts[entry["dataset_name"]] = counts.get(entry["dataset_name"], 0) + 1
+        scores = {
+            entry["dataset_name"]: entry["score"]
+            for entry in named
+            if counts[entry["dataset_name"]] == 1 and _is_number(entry.get("score"))
+        }
+    view: dict[str, Any] = dict(rest)
+    if scores:
+        view[_SCORE_BY_DATASET_KEY] = scores
+    if gates:
+        results = {
+            name: {
+                "gate": gate,
+                "score": scores.get(name),
+                "met": name in scores and scores[name] >= gate,
+            }
+            for name, gate in gates.items()
+        }
+        view[_GATES_KEY] = results
+        view[_GATES_UNMET_KEY] = sorted(n for n, r in results.items() if not r["met"])
+        view[_GATES_CHECKED_KEY] = len(results)
+    return view
+
+
+_REQUIRED_LATENT_KEY: Final = "required_fixed_latent_sha256"
+
+
+def _with_required_latent(value: Any, sha256: str | None) -> Any:
+    """`point.yaml` with the catalog's fixed-latent checksum beside the declared one.
+
+    A model whose reference fixes the initial latent (the T2V rules'
+    `fixed_latent.pt`) carries its sha256 in the catalog; a row compares the
+    point's declared `fixed_latent_sha256` against it. Always the checker's
+    value: an uploaded `required_fixed_latent_sha256` is replaced or dropped.
+    """
+    if not isinstance(value, Mapping):
+        return value
+    rest = {k: v for k, v in value.items() if k != _REQUIRED_LATENT_KEY}
+    if sha256 is None:
+        return rest if len(rest) != len(value) else value
+    return {**rest, _REQUIRED_LATENT_KEY: sha256}
 
 
 class StrictLoader(yaml.SafeLoader):
@@ -251,7 +417,9 @@ class Node:
         carrying it surfaces `system_tps` (§4.4's official reading: the steady
         window's TPS where one holds, the whole-run value otherwise) and
         `full_run_system_tps` (the whole-run value) beside it
-        (`_with_system_tps`); the parsed document itself stays as written.
+        (`_with_system_tps`). A video model's summary is read in frames
+        instead, as `system_fps` (`_with_system_fps`). The parsed document
+        itself stays as written.
 
         Args:
             name (str): The artifact's file name, one of the
@@ -262,9 +430,51 @@ class Node:
                 parse error: ...").
         """
         value, error = self.artifacts.get(name, (MISSING, None))
+        if value is MISSING:
+            return value, error
         if name == "result_summary.json":
-            value = _with_system_tps(value)
+            frames = self.frames_per_sample()
+            value = (
+                _with_system_tps(value)
+                if frames is None
+                else _with_system_fps(value, frames)
+            )
+        elif name == "accuracy_results.json":
+            value = _with_score_by_dataset(value, self._catalog_view("accuracy_gates"))
+        elif name == "point.yaml":
+            value = _with_required_latent(value, self._fixed_latent_sha256())
         return value, error
+
+    def _model_name(self) -> Any:
+        """The `model_name` this node's `point.yaml` declares, if any."""
+        point_doc, _ = self.artifacts.get("point.yaml", (MISSING, None))
+        return point_doc.get("model_name") if isinstance(point_doc, Mapping) else None
+
+    def _catalog_view(self, method: str) -> Any:
+        """`Catalog.<method>(model_name)` for this node, or None without a catalog."""
+        catalog = self.root().ruleset
+        if catalog is None:
+            return None
+        return getattr(catalog, method)(self._model_name())
+
+    def _fixed_latent_sha256(self) -> str | None:
+        """The catalog's fixed-latent checksum for this node's model, if it has one."""
+        catalog = self.root().ruleset
+        entry = catalog.model_entry(self._model_name()) if catalog is not None else None
+        sha256 = entry.get("fixed_latent_sha256") if entry is not None else None
+        return sha256 if isinstance(sha256, str) else None
+
+    def frames_per_sample(self) -> float | None:
+        """Frames in one sample of this run's model, when the catalog says it is video.
+
+        The model is the one this node's `point.yaml` declares; the decision is
+        `Catalog.frames_per_sample`, the one the pareto's `token_output` uses.
+
+        Returns:
+            float | None: e.g. 81 for `wan-2.2-t2v-a14b`, None for an LLM, a node
+                without a `point.yaml`, or a run with no catalog.
+        """
+        return self._catalog_view("frames_per_sample")
 
     def scopes(self) -> dict[str, dict[str, Any]]:
         """Per-node field mappings that `Ref.resolve` in `compare.py` reads.

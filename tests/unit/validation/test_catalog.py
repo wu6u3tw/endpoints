@@ -118,3 +118,47 @@ class TestCatalogFromRuleset:
         catalog = Catalog.from_ruleset("mlperf-endpoints-current")
         assert catalog.models == {}
         assert catalog.datasets == {}
+
+
+class TestModelLookups:
+    """The per-model questions the checker asks the catalog."""
+
+    @staticmethod
+    def _catalog(**entry):
+        return Catalog({"m": entry}, {})
+
+    @pytest.mark.unit
+    @pytest.mark.parametrize(
+        "entry, frames",
+        [
+            ({"frames_per_sample": 81}, 81),
+            ({"frames_per_sample": None}, None),
+            ({"frames_per_sample": True}, None),
+            ({}, None),
+        ],
+    )
+    def test_frames_per_sample_is_numeric_or_none(self, entry, frames):
+        assert self._catalog(**entry).frames_per_sample("m") == frames
+
+    @pytest.mark.unit
+    def test_an_unknown_model_has_no_entry(self):
+        catalog = self._catalog()
+        assert catalog.model_entry("other") is None
+        assert catalog.model_entry(None) is None
+        assert catalog.frames_per_sample("other") is None
+        assert catalog.accuracy_gates("other") == {}
+
+    @pytest.mark.unit
+    def test_a_sets_own_lower_target_gates_it(self):
+        sets = {
+            "a": {"targets": {"score": {"lower": 70.0, "factor": 0.5}}},
+            "band": {"targets": {"len": {"band": [1, 2], "factor": 0.9}}},
+            "two": {
+                "targets": {
+                    "x": {"lower": 1.0, "factor": 1.0},
+                    "y": {"lower": 1.0, "factor": 1.0},
+                }
+            },
+            "none": {"unit_samples": 3},
+        }
+        assert self._catalog(accuracy_datasets=sets).accuracy_gates("m") == {"a": 35.0}

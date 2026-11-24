@@ -125,3 +125,28 @@ deepseek-v4_1-flash:
     inline: { dataset: agentic_combined, lower: 52.36 }
     swebench: { dataset: swe_bench, mean_of_n: 4, lower: 96.4 }
     osl: { field: output_sequence_lengths_full_run, band: [793, 970] }
+
+# Text-to-video: the unit of output is a frame (`frames_per_sample` per
+# generated clip), not a token. A model carrying `frames_per_sample` is a video
+# benchmark: the checker reports its throughput as `system_fps` (successful
+# clips x frames over the run) in place of `system_tps`, skips the token checks and checks end-to-end latency
+# instead. Its accuracy gate lives on the set (`targets`), the one copy the
+# generic `point_accuracy_gate` row derives `factor x lower` from. The
+# reference fixes the initial latent; `fixed_latent_sha256` is its checksum,
+# which each point declares.
+wan-2.2-t2v-a14b:
+  name: wan-2.2-t2v-a14b
+  family: wan
+  reference_id: Wan-AI/Wan2.2-T2V-A14B-Diffusers
+  reference_source: none
+  accuracy_targets: {}
+  min_queries: 248
+  agentic: false
+  frames_per_sample: 81
+  fixed_latent_sha256: 55b16771aff295da3978aef8075bfbe2d5d8b2d5eeaa36bd65cb73dc54e33e6f
+  accuracy_datasets:
+    wan22_vbench:
+      unit_samples: 248
+      num_repeats: 1
+      targets:
+        vbench_score: { lower: 70.48, factor: 0.99 }

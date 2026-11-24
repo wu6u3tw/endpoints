@@ -72,7 +72,9 @@ below it). Each run directory `r<N>/` carries its own `system_desc.json`
 throughput - read as Section 4.4's official value: the steady-state window's TPS
 (`steady_state.tps.system`) wherever the summary carries a valid window
 (`steady_state.window`), the whole-run `tps` otherwise; the whole-run reading
-stays addressable as `full_run_system_tps`.
+stays addressable as `full_run_system_tps`. A video model (the catalog's
+`frames_per_sample`) reports frames per second as `system_fps` (and
+`full_run_system_fps`) instead, and the point's throughput is read from it.
 
 A submission may carry several paretos - one `<system>/<model>` pair each; each
 check runs once per instance of its scope ("Check blocks" below), so a
@@ -675,7 +677,10 @@ unchecked).
     (`provisioned_power_kw`, ...)
   - `<scope>.result_summary.<key>` - `result_summary.json`'s raw metrics
     (`point.result_summary.system_tps`, ...)
-  - `<scope>.accuracy_results.<key>` - `accuracy_results.json`
+  - `<scope>.accuracy_results.<key>` - `accuracy_results.json`, plus the
+    checker's own `score_by_dataset.<set>`, `gates.<set>`, `gates_unmet` and
+    `gates_checked` (from the catalog's per-set `targets`; an upload carrying
+    any of these reads as unscored)
   - `<scope>.results.<key>` - `results.json` (the results summary rollup)
 - `derived.<name>` - one pareto's named derivations (see `DESIGN.md` for each
   source formula). They are per-pareto, so only `pareto.yaml`/`point.yaml` rows
@@ -691,6 +696,9 @@ unchecked).
   - `derived.agentic` - the catalog's agentic flag for the declared model (the
     declared shape's reading where no catalog entry exists)
   - `derived.out_of_range_points` - Section 5.4's flagged points tuple
+  - `derived.token_output` - whether the declared model answers in tokens (false
+    for a catalog model with `frames_per_sample`: a video benchmark)
+  - `derived.model_count` - the distinct `model_name`s the points declare
 - `ruleset` - the packaged ruleset the cohort's `cohort.yaml` names (a
   registered round, e.g. `mlperf-inference-v6.1`):
   - `ruleset.models.<name>.<key>` - model definitions (the round's `models.py`)

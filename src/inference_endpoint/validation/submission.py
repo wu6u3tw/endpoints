@@ -183,7 +183,8 @@ class Point:
             a dedicated Offline run.
         concurrency (int): The run's declared point concurrency (§8.3).
         system_tps (float): §4.1's aggregate metric in the run's
-            `result_summary.json` (§8.1).
+            `result_summary.json` (§8.1): `system_tps` for a token benchmark,
+            `system_fps` (frames/s) for a video one.
         system_desc (Mapping[str, Any]): This run's own `system_desc.json` fields
             (§8.2.1).
         node (Node | None): The run directory's tree node. `None` on a
@@ -215,7 +216,8 @@ class Point:
 
         Per §8.2.1/§8.3 the run carries its own `system_desc.json` and
         `point.yaml`. `system_tps` is §4.1's aggregate metric in the run's
-        `result_summary.json` (§8.1), not a `point.yaml` field.
+        `result_summary.json` (§8.1), not a `point.yaml` field; a video model
+        (the catalog's `frames_per_sample`) reports it as `system_fps`.
 
         Args:
             node (Node): The `r<N>` run directory's tree node.
@@ -241,8 +243,11 @@ class Point:
             f"{node.dir}/system_desc.json",
         )
         summary = _mapping_artifact(node, "result_summary.json")
+        throughput_key = (
+            "system_tps" if node.frames_per_sample() is None else "system_fps"
+        )
         system_tps = _finite_fact(
-            summary, "system_tps", f"{node.dir}/result_summary.json"
+            summary, throughput_key, f"{node.dir}/result_summary.json"
         )
         return cls(
             offline=offline,
@@ -481,19 +486,56 @@ class Pareto:
             bool: The catalog's flag for the declared model, else the declared
                 shape's reading.
         """
-        catalog = self._catalog()
-        model_name = self._model_name()
-        if catalog is not None and model_name is not None:
-            entry = catalog.models.get(model_name)
-            if isinstance(entry, Mapping):
-                return bool(entry.get("agentic", False))
+        entry = self._catalog_entry()
+        if entry is not None:
+            return bool(entry.get("agentic", False))
         return not any(p.offline is not None for p in self.points)
+
+    def token_output(self) -> bool:
+        """Whether this pareto's benchmark answers in tokens, from the catalog first.
+
+        §4.1's TPOT and output-token metrics need a token stream. A video
+        benchmark (the catalog entry's `frames_per_sample`) answers with a
+        file, so its points are checked on latency instead. A pareto with no
+        catalog entry reads as a token benchmark: the strict side, so a
+        missing ruleset never switches the token checks off.
+
+        Returns:
+            bool: False for a catalog model with a numeric `frames_per_sample`
+                (`Catalog.frames_per_sample`, the test each point's frame rate
+                uses too), True otherwise.
+        """
+        catalog = self._catalog()
+        if catalog is None:
+            return True
+        return catalog.frames_per_sample(self._model_name()) is None
+
+    def model_count(self) -> int:
+        """How many distinct `model_name`s the pareto's points declare.
+
+        One pareto is one model's curve: the pareto-level facts (`agentic`,
+        `token_output`) read the first declared name, which is sound only
+        when every point declares the same one.
+
+        Returns:
+            int: The distinct declared names; 1 for a well-formed pareto.
+        """
+        return len({p.model_name for p in self.points if p.model_name})
 
     def _catalog(self) -> Catalog | None:
         """The ruleset catalog this pareto's tree was built with, if any."""
         if self.node is None:
             return None
         return self.node.root().ruleset
+
+    def _catalog_entry(self) -> Mapping[str, Any] | None:
+        """The catalog entry for the pareto's declared model, if there is one."""
+        catalog = self._catalog()
+        model_name = self._model_name()
+        if catalog is None or model_name is None:
+            return None
+        entry = catalog.models.get(model_name)
+        return entry if isinstance(entry, Mapping) else None
 
     def _model_name(self) -> str | None:
         """The first `model_name` the pareto's points declare."""
@@ -763,6 +805,8 @@ _DERIVATION_METHODS: dict[str, Callable[[Pareto], Any]] = {
     "uncovered_regions": Pareto.uncovered_regions,
     "offline_points": Pareto.offline_points,
     "agentic": Pareto.agentic,
+    "token_output": Pareto.token_output,
+    "model_count": Pareto.model_count,
     "out_of_range_points": lambda pareto: pareto.out_of_range_points(pareto.regions()),
 }
 

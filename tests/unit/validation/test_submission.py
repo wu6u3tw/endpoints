@@ -641,6 +641,7 @@ class TestDerivedExposure:
     def test_the_derivation_names_are_the_policy_derivations(self):
         assert set(DERIVATION_NAMES) == {
             "agentic",
+            "model_count",
             "accuracy_run_count",
             "accuracy_run_count_requirement",
             "offline_ordering",
@@ -649,6 +650,7 @@ class TestDerivedExposure:
             "point_cap",
             "point_count",
             "point_count_min",
+            "token_output",
             "uncovered_regions",
         }
 

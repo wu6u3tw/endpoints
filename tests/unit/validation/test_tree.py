@@ -25,6 +25,7 @@ import json
 import os
 
 import pytest
+from inference_endpoint.validation.catalog import Catalog
 from inference_endpoint.validation.operations import Absent, Predicate
 from inference_endpoint.validation.ranges import Interval
 from inference_endpoint.validation.refs import Ref
@@ -166,6 +167,224 @@ class TestRead:
         assert error is None
         assert value["system_tps"] == 6000.0
         assert value["tps"] == 6000.0 and value["qps"] == 12.5
+
+    def _video_point(self, tmp_path, summary, model="wan-2.2-t2v-a14b"):
+        root = tmp_path / "acme"
+        point_dir = root / "results" / "sys" / model / "r8"
+        point_dir.mkdir(parents=True)
+        (point_dir / "result_summary.json").write_text(json.dumps(summary))
+        (point_dir / "point.yaml").write_text(f"model_name: {model}\n")
+        catalog = Catalog(
+            {"wan-2.2-t2v-a14b": {"frames_per_sample": 81}, "llm": {}}, {}
+        )
+        node = SubmissionNode.from_directory(root, ruleset=catalog)
+        return node.children[0].children[0].children[0]
+
+    @pytest.mark.unit
+    def test_a_video_run_reads_its_system_fps_in_frames_per_second(self, tmp_path):
+        point = self._video_point(
+            tmp_path,
+            {"tps": None, "qps": 1.0, "n_samples_completed": 4, "n_samples_failed": 0},
+        )
+        value, error = point.read("result_summary.json")
+        assert error is None
+        assert value["system_fps"] == 81.0
+        assert value["full_run_system_fps"] == 81.0
+        assert "system_tps" not in value
+        assert "full_run_system_tps" not in value
+        assert value["n_samples_succeeded"] == 4
+        assert value["tps"] is None
+
+    @pytest.mark.unit
+    def test_failed_clips_add_no_frames(self, tmp_path):
+        # qps counts failed samples; only the 3 generated clips of 4 give frames.
+        point = self._video_point(
+            tmp_path,
+            {"tps": None, "qps": 1.0, "n_samples_completed": 4, "n_samples_failed": 1},
+        )
+        value, _ = point.read("result_summary.json")
+        assert value["system_fps"] == pytest.approx(0.75 * 81)
+        assert value["n_samples_succeeded"] == 3
+
+    @pytest.mark.unit
+    def test_a_video_run_without_qps_gets_no_system_fps(self, tmp_path):
+        point = self._video_point(
+            tmp_path,
+            {"tps": None, "qps": None, "n_samples_completed": 4, "n_samples_failed": 0},
+        )
+        value, _ = point.read("result_summary.json")
+        assert "system_fps" not in value
+
+    @pytest.mark.unit
+    def test_a_video_run_without_sample_counts_gets_no_system_fps(self, tmp_path):
+        point = self._video_point(tmp_path, {"tps": None, "qps": 1.0})
+        value, _ = point.read("result_summary.json")
+        assert "system_fps" not in value
+
+    @pytest.mark.unit
+    @pytest.mark.parametrize(
+        "uploaded",
+        [
+            {"system_fps": 1.0, "full_run_system_fps": 1.0},
+            {"system_tps": 1.0, "full_run_system_tps": 1.0},
+            {"tps": 3.0},
+        ],
+    )
+    def test_the_frame_rate_replaces_an_uploaded_throughput(self, tmp_path, uploaded):
+        summary = {"qps": 1.0, "n_samples_completed": 4, "n_samples_failed": 0}
+        point = self._video_point(tmp_path, {**summary, **uploaded})
+        value, _ = point.read("result_summary.json")
+        assert value["system_fps"] == 81.0
+        assert value["full_run_system_fps"] == 81.0
+        assert "system_tps" not in value
+        assert "full_run_system_tps" not in value
+
+    @pytest.mark.unit
+    def test_an_uploaded_succeeded_count_is_replaced(self, tmp_path):
+        point = self._video_point(
+            tmp_path,
+            {
+                "qps": 1.0,
+                "n_samples_completed": 4,
+                "n_samples_failed": 4,
+                "n_samples_succeeded": 4,
+            },
+        )
+        value, _ = point.read("result_summary.json")
+        assert value["n_samples_succeeded"] == 0
+
+    @pytest.mark.unit
+    def test_a_token_model_keeps_a_null_tps_unaliased(self, tmp_path):
+        point = self._video_point(tmp_path, {"tps": None, "qps": 1.0}, model="llm")
+        value, _ = point.read("result_summary.json")
+        assert "system_tps" not in value
+        assert "system_fps" not in value
+
+    def _video_run(self, tmp_path, summary):
+        root = tmp_path / "acme"
+        run_dir = root / "results" / "sys" / "wan-2.2-t2v-a14b" / "r8"
+        run_dir.mkdir(parents=True)
+        (run_dir / "result_summary.json").write_text(json.dumps(summary))
+        (run_dir / "point.yaml").write_text(
+            "model_name: wan-2.2-t2v-a14b\nconcurrency: 8\n"
+        )
+        (run_dir / "system_desc.json").write_text(
+            json.dumps({"max_supported_concurrency": 64})
+        )
+        catalog = Catalog({"wan-2.2-t2v-a14b": {"frames_per_sample": 81}}, {})
+        node = SubmissionNode.from_directory(root, ruleset=catalog)
+        return node.children[0].children[0].children[0]
+
+    @pytest.mark.unit
+    def test_a_video_point_takes_its_throughput_from_system_fps(self, tmp_path):
+        node = self._video_run(
+            tmp_path,
+            {"tps": None, "qps": 1.0, "n_samples_completed": 4, "n_samples_failed": 1},
+        )
+        assert Point.from_node(node).system_tps == pytest.approx(0.75 * 81)
+
+    @pytest.mark.unit
+    def test_a_video_point_without_system_fps_is_refused(self, tmp_path):
+        # No sample counts, so no frame rate; an uploaded system_tps is no stand-in.
+        node = self._video_run(tmp_path, {"tps": 999.0, "system_tps": 999.0})
+        with pytest.raises(ValueError, match="system_fps"):
+            Point.from_node(node)
+
+    def _gated_point(self, tmp_path, accuracy):
+        root = tmp_path / "acme"
+        point_dir = root / "results" / "sys" / "wan-2.2-t2v-a14b" / "r8"
+        point_dir.mkdir(parents=True)
+        (point_dir / "point.yaml").write_text("model_name: wan-2.2-t2v-a14b\n")
+        (point_dir / "accuracy_results.json").write_text(json.dumps(accuracy))
+        target = {"vbench_score": {"lower": 70.0, "factor": 0.5}}
+        entry = {"accuracy_datasets": {"wan22_vbench": {"targets": target}}}
+        catalog = Catalog({"wan-2.2-t2v-a14b": entry}, {})
+        node = SubmissionNode.from_directory(root, ruleset=catalog)
+        return node.children[0].children[0].children[0]
+
+    @pytest.mark.unit
+    @pytest.mark.parametrize(
+        "scores, unmet",
+        [
+            ([{"dataset_name": "wan22_vbench", "score": 35.0}], []),
+            ([{"dataset_name": "wan22_vbench", "score": 34.9}], ["wan22_vbench"]),
+            ([{"dataset_name": "other", "score": 99.0}], ["wan22_vbench"]),
+        ],
+    )
+    def test_the_catalog_gate_is_judged_per_set(self, tmp_path, scores, unmet):
+        point = self._gated_point(tmp_path, {"accuracy_scores": scores})
+        value, _ = point.read("accuracy_results.json")
+        assert value["gates"]["wan22_vbench"]["gate"] == 35.0
+        assert value["gates_unmet"] == unmet
+        assert value["gates_checked"] == 1
+
+    @pytest.mark.unit
+    def test_an_uploaded_gate_view_is_replaced(self, tmp_path):
+        point = self._gated_point(
+            tmp_path,
+            {
+                "accuracy_scores": [{"dataset_name": "wan22_vbench", "score": 1.0}],
+                "gates_unmet": [],
+            },
+        )
+        value, _ = point.read("accuracy_results.json")
+        assert value["gates_unmet"] == ["wan22_vbench"]
+
+    @pytest.mark.unit
+    def test_scores_surface_by_dataset_name(self, tmp_path):
+        point = self._point(
+            tmp_path,
+            {
+                "accuracy_results.json": {
+                    "accuracy_scores": [
+                        {"dataset_name": "wan22_vbench", "score": 1.0},
+                        {"dataset_name": "bad", "score": True},
+                        {"score": 2.0},
+                    ]
+                }
+            },
+        )
+        value, _ = point.read("accuracy_results.json")
+        assert value["score_by_dataset"] == {"wan22_vbench": 1.0}
+
+    @pytest.mark.unit
+    def test_a_set_scored_twice_is_left_out(self, tmp_path):
+        point = self._point(
+            tmp_path,
+            {
+                "accuracy_results.json": {
+                    "accuracy_scores": [
+                        {"dataset_name": "wan22_vbench", "score": 70.0},
+                        {"dataset_name": "wan22_vbench", "score": 5.0},
+                        {"dataset_name": "other", "score": 1.0},
+                    ]
+                }
+            },
+        )
+        value, _ = point.read("accuracy_results.json")
+        assert value["score_by_dataset"] == {"other": 1.0}
+
+    @pytest.mark.unit
+    def test_an_uploaded_score_view_is_never_read(self, tmp_path):
+        point = self._point(
+            tmp_path,
+            {
+                "accuracy_results.json": {
+                    "accuracy_scores": [{"dataset_name": "wan22_vbench", "score": 5.0}],
+                    "score_by_dataset": {"wan22_vbench": 99.0},
+                }
+            },
+        )
+        value, _ = point.read("accuracy_results.json")
+        assert "score_by_dataset" not in value
+
+    @pytest.mark.unit
+    def test_a_document_without_usable_scores_is_left_as_written(self, tmp_path):
+        point = self._point(
+            tmp_path, {"accuracy_results.json": {"accuracy_scores": "none"}}
+        )
+        value, _ = point.read("accuracy_results.json")
+        assert value == {"accuracy_scores": "none"}
 
     @pytest.mark.unit
     def test_an_explicit_system_tps_wins_over_the_client_alias(self, tmp_path):

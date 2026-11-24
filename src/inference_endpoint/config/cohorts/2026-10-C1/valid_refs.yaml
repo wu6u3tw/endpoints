@@ -32,6 +32,9 @@ point:
     seed_set: { type: str }
     target_cohort: { type: str }
     model_name: { type: str }
+    fixed_latent_sha256: { type: str }
+    # The catalog's checksum for the declared model, written by the checker.
+    required_fixed_latent_sha256: { type: str }
     model_precision: { type: str }
     model_notes: { type: str }
     dataset: { type: str }
@@ -183,6 +186,8 @@ point:
     n_samples_issued: { type: int }
     n_samples_completed: { type: int }
     n_samples_failed: { type: int }
+    # n_samples_completed - n_samples_failed, written by the checker.
+    n_samples_succeeded: { type: int }
     n_samples_dropped: { type: int }
     output_sequence_lengths: dict
     output_sequence_lengths_full_run: { type: dict, nullable: true }
@@ -203,6 +208,10 @@ point:
     # The whole-run aggregate (`tps`) under its own name; `system_tps` is the
     # §4.4 official reading.
     full_run_system_tps: { type: float, nullable: true }
+    # A video benchmark's throughput in frames/s, written by the checker in
+    # place of `system_tps` (successful clips x frames_per_sample / run window).
+    system_fps: { type: float }
+    full_run_system_fps: { type: float }
   accuracy_results: dict
   results: dict
   system_power:

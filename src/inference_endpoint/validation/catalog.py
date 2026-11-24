@@ -26,6 +26,7 @@ pseudo-enum classes; a check addresses them through the `ruleset` namespace of
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any
@@ -34,6 +35,7 @@ import yaml
 
 from inference_endpoint.config.ruleset_registry import get_ruleset
 from inference_endpoint.config.rulesets.mlcommons.rules import RoundRuleset
+from inference_endpoint.validation.ranges import Interval
 from inference_endpoint.validation.tree import StrictLoader
 
 
@@ -105,9 +107,78 @@ class Catalog:
             _load_mapping(root / "datasets.yaml"),
         )
 
+    def model_entry(self, name: Any) -> Mapping[str, Any] | None:
+        """The catalog entry for model `name`, or None when there is none.
+
+        Args:
+            name (Any): A declared `model_name` (anything not a string has none).
+        Returns:
+            Mapping[str, Any] | None: The entry, e.g. `models.yaml`'s
+                `wan-2.2-t2v-a14b` block; None for an unknown or non-string name.
+        """
+        entry = self.models.get(name) if isinstance(name, str) else None
+        return entry if isinstance(entry, Mapping) else None
+
+    def frames_per_sample(self, name: Any) -> float | None:
+        """Frames in one sample of model `name` when the catalog says it is video.
+
+        The one place the checker decides "video or tokens": a model whose
+        entry carries a numeric `frames_per_sample` answers in frames, anything
+        else (no entry, no key, a non-numeric value) in tokens.
+
+        Args:
+            name (Any): A declared `model_name`.
+        Returns:
+            float | None: 81 for `wan-2.2-t2v-a14b`, None for a token model.
+        """
+        entry = self.model_entry(name)
+        frames = entry.get("frames_per_sample") if entry is not None else None
+        if isinstance(frames, int | float) and not isinstance(frames, bool):
+            return frames
+        return None
+
+    def accuracy_gates(self, name: Any) -> dict[str, float]:
+        """Each accuracy set's gate for model `name`: `factor x lower` of its `targets`.
+
+        Only a set's own `targets` in the `{ lower, factor }` form gate here (the
+        set's score is then one number to compare). Bands, means over several
+        sets and agentic targets are left to their own rows.
+
+        Args:
+            name (Any): A declared `model_name`.
+        Returns:
+            dict[str, float]: Set name to its gate, e.g.
+                `{"wan22_vbench": 69.7752}`; empty when no set declares one.
+        """
+        entry = self.model_entry(name)
+        sets = entry.get("accuracy_datasets") if entry is not None else None
+        if not isinstance(sets, Mapping):
+            return {}
+        gates: dict[str, float] = {}
+        for set_name, spec in sets.items():
+            targets = spec.get("targets") if isinstance(spec, Mapping) else None
+            if not isinstance(targets, Mapping) or len(targets) != 1:
+                continue
+            (target,) = targets.values()
+            gate = _lower_gate(target)
+            if gate is not None:
+                gates[set_name] = gate
+        return gates
+
     def scopes(self) -> dict[str, dict[str, Any]]:
         """What the `ruleset` namespace of `Ref.resolve` answers, for `Node.scopes`."""
         return {"models": self.models, "datasets": self.datasets}
+
+
+def _lower_gate(target: Any) -> float | None:
+    """`factor x lower` of a `{ lower, factor }` target, or None for any other form."""
+    if not isinstance(target, Mapping) or set(target) != {"lower", "factor"}:
+        return None
+    lower, factor = target["lower"], target["factor"]
+    numbers = (lower, factor)
+    if not all(isinstance(v, int | float) and not isinstance(v, bool) for v in numbers):
+        return None
+    return Interval.for_accuracy_gate(lower, factor).lo
 
 
 def _load_mapping(path: Path) -> dict[str, Any]:

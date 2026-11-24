@@ -192,6 +192,8 @@ point_output_tokens_present:
   rule: "Endpoints Policy §14, Metric Consistency; §4.1, Metrics."
   fix: Re-run with a tokenizer so the summary carries output_sequence_lengths.total.
   severity: fail
+  when:
+    - { left: derived.token_output, op: eq, right: true }
   assert:
     - {
         left: point.result_summary.output_sequence_lengths.total,
@@ -206,8 +208,19 @@ point_tpot_p90_positive:
   severity: fail
   when:
     - { left: point.config.offline, op: ne, right: dedicated }
+    - { left: derived.token_output, op: eq, right: true }
   assert:
     - { left: point.result_summary.tpot.percentiles.90, op: gt, right: 0 }
+
+point_latency_p90_positive:
+  description: A video run reports a positive P90 end-to-end latency (it has no TPOT).
+  rule: "Endpoints Policy §9.1, Automated Checks; §4.1, Metrics (T2V proposal in docs/t2v/README.md)."
+  fix: Re-run so the summary carries a positive latency.percentiles["90"].
+  severity: fail
+  when:
+    - { left: derived.token_output, op: eq, right: false }
+  assert:
+    - { left: point.result_summary.latency.percentiles.90, op: gt, right: 0 }
 
 point_sample_count_floor:
   description: The run completed at least its dataset's §12 acceptance count.
@@ -313,6 +326,18 @@ point_sample_count_floor_open_orca:
       op: ge
       right: 24576
 
+point_sample_count_floor_wan22:
+  description: The WAN 2.2 performance run generated at least 50 clips (failed clips do not count).
+  rule: "Endpoints Policy §12, Dataset Requirements; §6.4, Minimum Query Count."
+  fix: Re-run until the generated clip count reaches 50.
+  severity: fail
+  when:
+    - { left: point.config.dataset_name, op: eq, right: wan22_perf }
+  assert:
+    - left: point.result_summary.n_samples_succeeded
+      op: ge
+      right: 50
+
 point_accuracy_scores_present:
   description: The run carries at least one accuracy result.
   rule: "Endpoints Policy §5.3, Accuracy Runs; §15, Accuracy."
@@ -333,6 +358,52 @@ point_accuracy_present:
   severity: warn
   assert:
     - { left: point.accuracy_results, op: exists }
+point_accuracy_gate:
+  description: Each accuracy set the catalog gates scores at least factor x its reference.
+  rule: "Endpoints Policy §15, Accuracy; §2.9.8, Accuracy Gate."
+  fix: Re-run the accuracy phase; each set in accuracy_results.gates_unmet is below its gate or has no score.
+  severity: fail
+  when:
+    - { left: point.accuracy_results.gates_checked, op: gt, right: 0 }
+  assert:
+    - {
+        left: point.accuracy_results.gates_unmet,
+        op: eq,
+        right: { literal: [] },
+      }
+
+point_video_no_failed_samples:
+  description: A video run has no failed samples (a failed clip produces no frames).
+  rule: "Endpoints Policy §9.1, Automated Checks; §6.4, Minimum Query Count."
+  fix: Fix the server errors and re-run until every clip is generated.
+  severity: fail
+  when:
+    - { left: derived.token_output, op: eq, right: false }
+  assert:
+    - { left: point.result_summary.n_samples_failed, op: eq, right: 0 }
+
+point_video_no_token_tps:
+  description: A video run reports no token throughput (its throughput is in frames).
+  rule: "Endpoints Policy §4.1, Metrics (T2V proposal in docs/t2v/README.md)."
+  fix: Re-run with a client that does not tokenize video responses (tps is null).
+  severity: fail
+  when:
+    - { left: derived.token_output, op: eq, right: false }
+  assert:
+    - { left: point.result_summary.tps, op: eq, right: null }
+
+point_fixed_latent_declared:
+  description: The point declares the reference fixed initial latent its server loaded.
+  rule: "MLPerf Inference text_to_video reference (fixed_latent.pt); Endpoints Policy §8.3, point.yaml."
+  fix: Load the reference fixed_latent.pt on the server and declare its sha256 as fixed_latent_sha256.
+  severity: fail
+  when:
+    - { left: point.config.required_fixed_latent_sha256, op: exists }
+  assert:
+    - left: point.config.fixed_latent_sha256
+      op: eq
+      right: point.config.required_fixed_latent_sha256
+
 point_offline_ordering:
   description: The dedicated Offline run meets §5.7.2's throughput and concurrency clauses.
   rule: "Endpoints Policy §5.7.2, Relationship to Maximum Supported Concurrency."

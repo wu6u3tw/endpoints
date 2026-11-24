@@ -17,6 +17,14 @@ pareto_point_cap:
   assert:
     - { left: derived.point_cap, op: eq, right: true }
 
+pareto_single_model:
+  description: Every point of the pareto declares the same model (one curve per model).
+  rule: "Endpoints Policy §5.1, Pareto Curve; §8.3, point.yaml."
+  fix: Move the points of another model into that model's own pareto.
+  severity: fail
+  assert:
+    - { left: derived.model_count, op: le, right: 1 }
+
 pareto_out_of_range_points:
   description: No point sits outside every region, margins included (§5.4/§9).
   rule: "Endpoints Policy §9.1, Automated Checks; §5.4, C_min."
